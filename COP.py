@@ -22,7 +22,7 @@ Usage:
 
 from __future__ import print_function, division
 
-import re, json, sys, math
+import re, json, sys, math, os
 from collections import defaultdict, deque
 
 # ===============================================================
@@ -95,52 +95,55 @@ class Netlist(object):
 # Order matters - more specific patterns first.
 CELL_TYPE_MAP = [
     # -- Flip-flops ---------------------------------------------
-    ('SDFFARX',  'DFF'),   # scan FF with async reset  <- your cell
+    # Must come before any AND/OR/XOR patterns to avoid false matches
+    ('SDFFARX',  'DFF'),   # scan FF with async reset (SDFFARX1_LVT)
     ('SDFF',     'DFF'),
     ('DFF',      'DFF'),
 
-    # -- Logic --------------------------------------------------
-    ('XNOR',     'XNOR'),
-    ('XOR',      'XOR'),
-    ('NAND',     'NAND'),
-    ('NOR',      'NOR'),
-    ('AND',      'AND'),
-    ('OR',       'OR'),
+    # -- Half-adder (before XOR so HADD is not caught by XOR) --
+    ('HADD',     'XOR'),   # HADDX1_LVT: SO=XOR output, C1=AND carry
+
+    # -- Complex cells: more specific patterns first ------------
+    # AND-OR-Invert
+    ('AOI222',   'NAND'),
+    ('AOI22',    'NAND'),
+    ('AOI21',    'NAND'),
+    # AND-OR
+    ('AO222',    'AND'),
+    ('AO221',    'AND'),
+    ('AO22',     'AND'),
+    ('AO21',     'AND'),
+    # OR-AND
+    ('OA221',    'OR'),
+    ('OA21',     'OR'),
+
+    # -- Standard logic (2/3/4-input variants) ------------------
+    # XNOR before XOR, NOR before OR, NAND before AND
+    ('XNOR',     'XNOR'),  # XNOR2X1_LVT
+    ('XOR3',     'XOR'),   # XOR3X1_LVT  (3-input)
+    ('XOR2',     'XOR'),   # XOR2X1_LVT
+    ('XOR',      'XOR'),   # catch-all
+    ('NAND',     'NAND'),  # NAND2X0_LVT, NAND3X0_LVT ...
+    ('NOR',      'NOR'),   # NOR2X0_LVT, NOR3X0_LVT, NOR4X1_LVT ...
+    ('AND',      'AND'),   # AND2X1_LVT, AND3X1_LVT ...
+    ('OR',       'OR'),    # OR2X1_LVT, OR3X1_LVT ...
 
     # -- Inverters / Buffers ------------------------------------
-    ('INVX',     'NOT'),   # INVX0_LVT, INVX8_LVT ...
+    ('INVX',     'NOT'),   # INVX0_LVT, INVX8_LVT
     ('NBUFF',    'BUF'),   # NBUFFX2_LVT, NBUFFX4_LVT
     ('BUF',      'BUF'),
 
     # -- MUX ----------------------------------------------------
-    ('MUX21',    'MUX'),   # MUX21X1_LVT -- ports A1,A2,S0 -> Y
-
-    # -- Complex cells (AND-OR, OR-AND, AND-OR-INVERT) ----------
-    # These are multi-input compound gates. The COP approximation
-    # treats them as AND/OR trees based on their dominant function.
-    ('AOI222',   'NAND'),  # AND-OR-Invert  -> approximate as NAND
-    ('AOI22',    'NAND'),
-    ('AOI21',    'NAND'),
-    ('AO222',    'AND'),   # AND-OR         -> approximate as AND
-    ('AO221',    'AND'),
-    ('AO22',     'AND'),
-    ('AO21',     'AND'),
-    ('OA221',    'OR'),    # OR-AND         -> approximate as OR
-    ('OA21',     'OR'),
-
-    # -- Half-adder ---------------------------------------------
-    ('HADD',     'XOR'),   # HADDX1_LVT: SO=XOR output, C1=carry
-    #                        We map to XOR; carry output C1 ignored
+    ('MUX21',    'MUX'),   # MUX21X1_LVT: ports A1, A2, S0 -> Y
 ]
 
-# Port names that carry the output of a gate
-OUTPUT_PORTS = {
-    'Y',    # standard combinational output
-    'Q',    # FF data output
-    'QN',   # FF inverted output (used by SDFFARX1_LVT)
-    'SO',   # HADDX1_LVT sum output  <- your HADD cells
-    'C1',   # HADDX1_LVT carry output (secondary -- handled below)
-}
+# Port names that carry the output of a gate.
+# ORDER MATTERS: use a list so Q is checked before QN for DFFs.
+# (A set gives no iteration-order guarantee in Python 2/3.)
+OUTPUT_PORTS_ORDERED = ['Q', 'QN', 'Y', 'SO', 'C1']
+
+# Keep a set for fast membership tests elsewhere
+OUTPUT_PORTS = set(OUTPUT_PORTS_ORDERED)
 
 
 def canonical_type(cell_name):
@@ -152,10 +155,20 @@ def canonical_type(cell_name):
 
 
 def parse_port_list(port_str):
-    """Parse .port(net) style connections into dict."""
+    """
+    Parse .port(net) style connections into dict.
+    Handles plain names (n42), bus names (stato[0]),
+    and DC escaped identifiers (\stato_reg[0] ).
+    """
     ports = {}
-    for m in re.finditer(r'\.(\w+)\s*\(\s*(\w*)\s*\)', port_str):
-        ports[m.group(1)] = m.group(2)
+    # Net name: optional backslash, word chars, optional [index],
+    # followed by optional whitespace (escaped ids end with a space in DC)
+    net_pat = r'(\\[\w\[\]./]+ *|[\w]+(?:\[\d+\])?)'
+    pat = re.compile(r'\.(\w+)\s*\(\s*' + net_pat + r'\s*\)')
+    for m in pat.finditer(port_str):
+        port = m.group(1)
+        net  = m.group(2).strip()
+        ports[port] = net
     return ports
 
 
@@ -205,8 +218,13 @@ def parse_verilog(filepath):
 
     # -- Gate instances -----------------------------------------
     # Pattern: CellType  InstanceName  ( .port(net), ... ) ;
+    # Instance names can be escaped: \stato_reg[0]  (ends at whitespace)
     inst_re = re.compile(
-        r'(\w+)\s+(\w+)\s*\(([^;]*?)\)\s*;', re.DOTALL)
+        r'(\w+)\s+(\\[^\s(]+|\w+)\s*\(([^;]*?)\)\s*;', re.DOTALL)
+
+    # Ports that are never data inputs: clocks, resets, scan enable, scan in
+    NON_DATA_PORTS = {'CLK', 'CK', 'RSTB', 'RST', 'RB', 'RN',
+                      'SE', 'SI', 'SIN', 'TE', 'TI'}
 
     for m in inst_re.finditer(mod_body):
         cell_name = m.group(1)
@@ -220,6 +238,8 @@ def parse_verilog(filepath):
 
         ctype = canonical_type(cell_name)
         if ctype == 'UNKNOWN':
+            # Uncomment the line below to debug unrecognised cells:
+            # print("  WARNING: unrecognised cell '{0}' (instance '{1}') -- skipped".format(cell_name, inst_name))
             continue
 
         ports = parse_port_list(port_str)
@@ -233,9 +253,9 @@ def parse_verilog(filepath):
         if not ports:
             continue
 
-        # Find output net
+        # Find output net — iterate the ordered list so Q wins over QN
         out_net = None
-        for op in OUTPUT_PORTS:
+        for op in OUTPUT_PORTS_ORDERED:
             if op in ports and ports[op]:
                 out_net = ports[op]
                 break
@@ -249,7 +269,9 @@ def parse_verilog(filepath):
                 continue
 
         inp_nets = [v for k, v in ports.items()
-                    if k not in OUTPUT_PORTS and v and v != out_net]
+                    if k not in OUTPUT_PORTS
+                    and k not in NON_DATA_PORTS
+                    and v and v != out_net]
 
         g = Gate(ctype, inst_name, out_net, inp_nets)
         nl.gates[inst_name] = g
@@ -276,8 +298,12 @@ def parse_verilog(filepath):
         # Track scan FFs
         if ctype == 'DFF':
             nl.scan_ffs.append(out_net)        # Q output = PPI
-            if inp_nets:
-                nl.scan_din.append(inp_nets[0]) # D input  = PPO
+            # Prefer the explicit D port; fall back to first input net
+            d_net = ports.get('D') or ports.get('d')
+            if d_net and d_net in inp_nets:
+                nl.scan_din.append(d_net)
+            elif inp_nets:
+                nl.scan_din.append(inp_nets[0])
 
     print("  Parsed: {0} gates, {1} PIs, {2} scan FFs".format(
         len(nl.gates), len(nl.pis), len(nl.scan_ffs)))
@@ -946,6 +972,9 @@ def generate_verilog_patch(shared_points, conventional_cps,
                 "// {2}-type CP".format(gate, net, cp_type))
         lines.append("")
 
+    out_dir = os.path.dirname(output_path)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
     with open(output_path, 'w') as f:
         f.write('\n'.join(lines))
 
@@ -958,6 +987,9 @@ def generate_verilog_patch(shared_points, conventional_cps,
 
 def write_json_report(shared_points, conventional_cps,
                       conventional_ops, output_path):
+    out_dir = os.path.dirname(output_path)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
     report = {
         'summary' : {
             'shared_points'     : len(shared_points),

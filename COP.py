@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
 SPAR: Shared Point Insertion for Area Overhead Reduction
 Kim et al., IEEE TCAD Vol.41 No.11, 2022
@@ -14,19 +15,21 @@ Fully autonomous flow:
 Usage:
   python 03_spar.py netlist/scan_netlist_flat.v [DTh] [cp_budget] [op_budget]
 
-  DTh        : difference threshold 0.0–1.0  (default 1.0, paper setting)
+  DTh        : difference threshold 0.0-1.0  (default 1.0, paper setting)
   cp_budget  : max CPs as fraction of scan cells (default 0.05 = 5%)
   op_budget  : max OPs as fraction of scan cells (default 0.05 = 5%)
 """
 
+from __future__ import print_function, division
+
 import re, json, sys, math
 from collections import defaultdict, deque
 
-# ═══════════════════════════════════════════════════════════════
-#  SECTION 1 — DATA STRUCTURES
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+#  SECTION 1 - DATA STRUCTURES
+# ===============================================================
 
-class Gate:
+class Gate(object):
     __slots__ = ('gtype','name','output','inputs')
     def __init__(self, gtype, name, output, inputs):
         self.gtype   = gtype    # canonical type string
@@ -34,7 +37,7 @@ class Gate:
         self.output  = output   # single output net name
         self.inputs  = inputs   # list[str] of input net names
 
-class Netlist:
+class Netlist(object):
     def __init__(self):
         self.gates    = {}                   # name  -> Gate
         self.net_src  = {}                   # net   -> Gate (driver)
@@ -45,7 +48,7 @@ class Netlist:
         self.scan_din = []                   # scan FF D-input nets (PPOs)
         self.all_nets = set()
 
-    # ── Traversal helpers ──────────────────────────────────────
+    # -- Traversal helpers --------------------------------------
 
     def fanout_cone(self, start_net, stop_at_ff=True):
         """BFS forward from start_net. Returns set of reachable nets."""
@@ -83,20 +86,20 @@ class Netlist:
         return visited
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SECTION 2 — GATE-LEVEL VERILOG PARSER
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+#  SECTION 2 - GATE-LEVEL VERILOG PARSER
+# ===============================================================
 
 # Map substrings in cell names to canonical gate types.
 # Add your library's cell name patterns here.
-# Order matters — more specific patterns first.
+# Order matters - more specific patterns first.
 CELL_TYPE_MAP = [
-    # ── Flip-flops ─────────────────────────────────────────────
-    ('SDFFARX',  'DFF'),   # scan FF with async reset  ← your cell
+    # -- Flip-flops ---------------------------------------------
+    ('SDFFARX',  'DFF'),   # scan FF with async reset  <- your cell
     ('SDFF',     'DFF'),
     ('DFF',      'DFF'),
 
-    # ── Logic ──────────────────────────────────────────────────
+    # -- Logic --------------------------------------------------
     ('XNOR',     'XNOR'),
     ('XOR',      'XOR'),
     ('NAND',     'NAND'),
@@ -104,28 +107,28 @@ CELL_TYPE_MAP = [
     ('AND',      'AND'),
     ('OR',       'OR'),
 
-    # ── Inverters / Buffers ────────────────────────────────────
+    # -- Inverters / Buffers ------------------------------------
     ('INVX',     'NOT'),   # INVX0_LVT, INVX8_LVT ...
     ('NBUFF',    'BUF'),   # NBUFFX2_LVT, NBUFFX4_LVT
     ('BUF',      'BUF'),
 
-    # ── MUX ────────────────────────────────────────────────────
-    ('MUX21',    'MUX'),   # MUX21X1_LVT — ports A1,A2,S0 → Y
+    # -- MUX ----------------------------------------------------
+    ('MUX21',    'MUX'),   # MUX21X1_LVT -- ports A1,A2,S0 -> Y
 
-    # ── Complex cells (AND-OR, OR-AND, AND-OR-INVERT) ──────────
+    # -- Complex cells (AND-OR, OR-AND, AND-OR-INVERT) ----------
     # These are multi-input compound gates. The COP approximation
     # treats them as AND/OR trees based on their dominant function.
-    ('AOI222',   'NAND'),  # AND-OR-Invert  → approximate as NAND
+    ('AOI222',   'NAND'),  # AND-OR-Invert  -> approximate as NAND
     ('AOI22',    'NAND'),
     ('AOI21',    'NAND'),
-    ('AO222',    'AND'),   # AND-OR         → approximate as AND
+    ('AO222',    'AND'),   # AND-OR         -> approximate as AND
     ('AO221',    'AND'),
     ('AO22',     'AND'),
     ('AO21',     'AND'),
-    ('OA221',    'OR'),    # OR-AND         → approximate as OR
+    ('OA221',    'OR'),    # OR-AND         -> approximate as OR
     ('OA21',     'OR'),
 
-    # ── Half-adder ─────────────────────────────────────────────
+    # -- Half-adder ---------------------------------------------
     ('HADD',     'XOR'),   # HADDX1_LVT: SO=XOR output, C1=carry
     #                        We map to XOR; carry output C1 ignored
 ]
@@ -135,8 +138,8 @@ OUTPUT_PORTS = {
     'Y',    # standard combinational output
     'Q',    # FF data output
     'QN',   # FF inverted output (used by SDFFARX1_LVT)
-    'SO',   # HADDX1_LVT sum output  ← your HADD cells
-    'C1',   # HADDX1_LVT carry output (secondary — handled below)
+    'SO',   # HADDX1_LVT sum output  <- your HADD cells
+    'C1',   # HADDX1_LVT carry output (secondary -- handled below)
 }
 
 
@@ -180,16 +183,16 @@ def parse_verilog(filepath):
         raw, re.DOTALL))
 
     if not modules:
-        raise ValueError(f"No module found in {filepath}")
+        raise ValueError("No module found in {0}".format(filepath))
 
     # Use the last module (usually the top after flattening)
     mod_body = modules[-1].group(2)
 
-    # ── Port declarations ──────────────────────────────────────
+    # -- Port declarations --------------------------------------
     def extract_signals(keyword, body):
         sigs = []
         for m in re.finditer(
-                rf'\b{keyword}\b\s*(?:\[\s*\d+\s*:\s*\d+\s*\])?\s*([\w\s,]+?)\s*;',
+                r'\b' + keyword + r'\b\s*(?:\[\s*\d+\s*:\s*\d+\s*\])?\s*([\w\s,]+?)\s*;',
                 body):
             for sig in re.split(r'[\s,]+', m.group(1)):
                 sig = sig.strip()
@@ -200,7 +203,7 @@ def parse_verilog(filepath):
     nl.pis = extract_signals('input',  mod_body)
     nl.pos = extract_signals('output', mod_body)
 
-    # ── Gate instances ─────────────────────────────────────────
+    # -- Gate instances -----------------------------------------
     # Pattern: CellType  InstanceName  ( .port(net), ... ) ;
     inst_re = re.compile(
         r'(\w+)\s+(\w+)\s*\(([^;]*?)\)\s*;', re.DOTALL)
@@ -276,15 +279,14 @@ def parse_verilog(filepath):
             if inp_nets:
                 nl.scan_din.append(inp_nets[0]) # D input  = PPO
 
-    print(f"  Parsed: {len(nl.gates)} gates, "
-          f"{len(nl.pis)} PIs, "
-          f"{len(nl.scan_ffs)} scan FFs")
+    print("  Parsed: {0} gates, {1} PIs, {2} scan FFs".format(
+        len(nl.gates), len(nl.pis), len(nl.scan_ffs)))
     return nl
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SECTION 3 — COP TESTABILITY (Paper Section II-A)
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+#  SECTION 3 - COP TESTABILITY (Paper Section II-A)
+# ===============================================================
 
 def compute_cop(nl):
     """
@@ -299,13 +301,13 @@ def compute_cop(nl):
     CC = {}
     CO = {}
 
-    # ── Initialise ────────────────────────────────────────────
+    # -- Initialise ---------------------------------------------
     for pi  in nl.pis:      CC[pi]  = 0.5
     for ppi in nl.scan_ffs: CC[ppi] = 0.5   # FF output treated as random
     for po  in nl.pos:      CO[po]  = 1.0
     for ppo in nl.scan_din: CO[ppo] = 1.0   # FF D-input is observable
 
-    # ── Forward pass: compute CC via topological BFS ──────────
+    # -- Forward pass: compute CC via topological BFS -----------
     # Repeat until stable (handles reconvergent fanouts approximately)
     MAX_ITER = 500
     for _ in range(MAX_ITER):
@@ -344,7 +346,7 @@ def compute_cop(nl):
                     cc = cc * (1.0 - v) + (1.0 - cc) * v
                 cc = 1.0 - cc
             elif t == 'MUX':
-                # D0, D1, SEL  →  out = SEL?D1:D0
+                # D0, D1, SEL  ->  out = SEL?D1:D0
                 if len(ins) >= 3:
                     d0, d1, sel = ins[0], ins[1], ins[2]
                     cc = sel * d1 + (1.0 - sel) * d0
@@ -363,7 +365,7 @@ def compute_cop(nl):
         if not changed:
             break
 
-    # ── Backward pass: compute CO ─────────────────────────────
+    # -- Backward pass: compute CO ------------------------------
     for _ in range(MAX_ITER):
         changed = False
         for g in nl.gates.values():
@@ -414,9 +416,9 @@ def compute_cop(nl):
     return CC, CO
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SECTION 4 — AUTONOMOUS CP/OP SITE IDENTIFICATION
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+#  SECTION 4 - AUTONOMOUS CP/OP SITE IDENTIFICATION
+# ===============================================================
 
 def identify_cp_op_sites(nl, CC, CO, cp_budget_frac=0.05,
                           op_budget_frac=0.05):
@@ -425,7 +427,7 @@ def identify_cp_op_sites(nl, CC, CO, cp_budget_frac=0.05,
     Mirrors the conventional TPI step in the paper's Fig. 4.
 
     CP sites: internal nets with low controllability
-              (hard-to-1 → OR-type, hard-to-0 → AND-type)
+              (hard-to-1 -> OR-type, hard-to-0 -> AND-type)
     OP sites: internal nets with low observability
 
     Budget: paper limits each to 5% of scan cell count.
@@ -443,7 +445,7 @@ def identify_cp_op_sites(nl, CC, CO, cp_budget_frac=0.05,
 
     internal_nets = [n for n in nl.all_nets if n not in excluded]
 
-    # ── CP candidates: sort by distance from 0.5 (most biased first) ──
+    # -- CP candidates: sort by distance from 0.5 (most biased first) --
     def cp_score(net):
         cc = CC.get(net, 0.5)
         return abs(cc - 0.5)   # higher = more biased = harder to control
@@ -462,7 +464,7 @@ def identify_cp_op_sites(nl, CC, CO, cp_budget_frac=0.05,
         cp_type = 'OR' if cc < 0.5 else 'AND'
         cp_list.append((net, cp_type))
 
-    # ── OP candidates: sort by ascending observability ────────
+    # -- OP candidates: sort by ascending observability ---------
     op_candidates = sorted(internal_nets,
                            key=lambda n: CO.get(n, 0.0))
 
@@ -476,17 +478,16 @@ def identify_cp_op_sites(nl, CC, CO, cp_budget_frac=0.05,
             break
         op_list.append(net)
 
-    print(f"  CP sites identified : {len(cp_list)} "
-          f"(budget {cp_limit}, {cp_budget_frac*100:.0f}% of "
-          f"{n_scan} scan FFs)")
-    print(f"  OP sites identified : {len(op_list)} "
-          f"(budget {op_limit})")
+    print("  CP sites identified : {0} (budget {1}, {2:.0f}% of {3} scan FFs)".format(
+        len(cp_list), cp_limit, cp_budget_frac * 100, n_scan))
+    print("  OP sites identified : {0} (budget {1})".format(
+        len(op_list), op_limit))
     return cp_list, op_list
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SECTION 5 — THRESHOLD COMPUTATION (Paper Eq. 5 & 6)
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+#  SECTION 5 - THRESHOLD COMPUTATION (Paper Eq. 5 & 6)
+# ===============================================================
 
 def compute_thresholds(cp_list, op_list, CC, CO):
     """
@@ -506,9 +507,9 @@ def compute_thresholds(cp_list, op_list, CC, CO):
     return CCTh, COTh
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SECTION 6 — CANDIDATE IDENTIFICATION (Paper Section IV)
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+#  SECTION 6 - CANDIDATE IDENTIFICATION (Paper Section IV)
+# ===============================================================
 
 def identify_shared_candidates(cp_list, op_list, CC, CO,
                                 CCTh, COTh):
@@ -522,14 +523,14 @@ def identify_shared_candidates(cp_list, op_list, CC, CO,
     ec_ops = [net for net in op_list
               if CCTh <= CC.get(net, 0.5) <= 1.0 - CCTh]
 
-    print(f"  EO-CPs : {len(eo_cps)} / {len(cp_list)}")
-    print(f"  EC-OPs : {len(ec_ops)} / {len(op_list)}")
+    print("  EO-CPs : {0} / {1}".format(len(eo_cps), len(cp_list)))
+    print("  EC-OPs : {0} / {1}".format(len(ec_ops), len(op_list)))
     return eo_cps, ec_ops
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SECTION 7 — CONE ANALYSIS (Paper Section V)
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+#  SECTION 7 - CONE ANALYSIS (Paper Section V)
+# ===============================================================
 
 def check_rule1(nl, eo_cp_net, ec_op_net):
     """
@@ -601,7 +602,7 @@ def check_rule2(nl, eo_cp_net, ec_op_net, cp_type, CC,
     # under the modified controllabilities
     direct_sinks = nl.net_dst.get(eo_cp_net, [])
     if not direct_sinks:
-        return True   # no fanout — no blocking possible
+        return True   # no fanout -- no blocking possible
 
     any_unblocked = False
     for sink_gate in direct_sinks:
@@ -634,9 +635,9 @@ def check_rule2(nl, eo_cp_net, ec_op_net, cp_type, CC,
     return any_unblocked     # True = at least one path unblocked
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SECTION 8 — CONTROLLABILITY OPTIMISATION (Paper Section VI)
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+#  SECTION 8 - CONTROLLABILITY OPTIMISATION (Paper Section VI)
+# ===============================================================
 
 def compute_cc_req(nl, eo_cp_net, cp_type):
     """
@@ -663,10 +664,10 @@ def compute_cc_req(nl, eo_cp_net, cp_type):
             continue
         cone_size = len(nl.fanout_cone(g.output))
         if g.gtype in ('OR', 'NOR'):
-            # eo_cp=1 dominates OR → blocks propagation of other faults
+            # eo_cp=1 dominates OR -> blocks propagation of other faults
             bx += cone_size
         elif g.gtype in ('AND', 'NAND'):
-            # eo_cp=0 dominates AND → blocks propagation
+            # eo_cp=0 dominates AND -> blocks propagation
             Bx += cone_size
 
     Fx    = max(fanout_total - bx - Bx, 0)
@@ -676,9 +677,9 @@ def compute_cc_req(nl, eo_cp_net, cp_type):
         return 0.5
 
     if cp_type == 'OR':
-        return Bx / total                   # Eq. 7
+        return Bx / float(total)                   # Eq. 7
     else:
-        return (Bx + Fx) / total            # Eq. 8
+        return (Bx + Fx) / float(total)            # Eq. 8
 
 
 def select_best_ec_op(candidate_nets, cc_req, CC, DTh=1.0):
@@ -707,9 +708,9 @@ def select_best_ec_op(candidate_nets, cc_req, CC, DTh=1.0):
     return best_net, best_inv
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SECTION 9 — MAIN SPAR FLOW (Paper Fig. 4)
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+#  SECTION 9 - MAIN SPAR FLOW (Paper Fig. 4)
+# ===============================================================
 
 def run_spar(netlist_path,
              DTh=1.0,
@@ -720,33 +721,33 @@ def run_spar(netlist_path,
     print(" SPAR: Shared Point Insertion for Area Overhead Reduction")
     print("="*55)
 
-    # ── Step 1: Parse netlist ──────────────────────────────────
+    # -- Step 1: Parse netlist ----------------------------------
     print("\n[1/7] Parsing netlist ...")
     nl = parse_verilog(netlist_path)
 
-    # ── Step 2: COP analysis ───────────────────────────────────
+    # -- Step 2: COP analysis -----------------------------------
     print("\n[2/7] COP testability analysis ...")
     CC, CO = compute_cop(nl)
-    print(f"  CC computed for {len(CC)} nets")
-    print(f"  CO computed for {len(CO)} nets")
+    print("  CC computed for {0} nets".format(len(CC)))
+    print("  CO computed for {0} nets".format(len(CO)))
 
-    # ── Step 3: CP/OP site identification ─────────────────────
+    # -- Step 3: CP/OP site identification ---------------------
     print("\n[3/7] Autonomous CP/OP site identification ...")
     cp_list, op_list = identify_cp_op_sites(
         nl, CC, CO, cp_budget, op_budget)
 
-    # ── Step 4: Threshold computation ─────────────────────────
+    # -- Step 4: Threshold computation -------------------------
     print("\n[4/7] Computing EO-CP / EC-OP thresholds ...")
     CCTh, COTh = compute_thresholds(cp_list, op_list, CC, CO)
-    print(f"  CCTh = {CCTh:.6f}")
-    print(f"  COTh = {COTh:.6f}")
+    print("  CCTh = {0:.6f}".format(CCTh))
+    print("  COTh = {0:.6f}".format(COTh))
 
-    # ── Step 5: Shared point candidates ───────────────────────
+    # -- Step 5: Shared point candidates -----------------------
     print("\n[5/7] Identifying shared point candidates ...")
     eo_cps, ec_ops = identify_shared_candidates(
         cp_list, op_list, CC, CO, CCTh, COTh)
 
-    # ── Step 6: Pairing ───────────────────────────────────────
+    # -- Step 6: Pairing ----------------------------------------
     print("\n[6/7] Pairing (cone analysis + ctrl optimisation) ...")
 
     shared_points = []
@@ -805,9 +806,10 @@ def run_spar(netlist_path,
         #   AND + inverted = Type 2
         #   OR  + direct   = Type 3
         #   OR  + inverted = Type 4
-        sp_type = (1 if cp_type == 'AND' and not use_inv else
-                   2 if cp_type == 'AND' and use_inv     else
-                   3 if cp_type == 'OR'  and not use_inv else 4)
+        if   cp_type == 'AND' and not use_inv: sp_type = 1
+        elif cp_type == 'AND' and use_inv:     sp_type = 2
+        elif cp_type == 'OR'  and not use_inv: sp_type = 3
+        else:                                  sp_type = 4
 
         cc_actual = (1.0 - CC.get(best_net, 0.5)) \
                     if use_inv else CC.get(best_net, 0.5)
@@ -827,7 +829,7 @@ def run_spar(netlist_path,
 
         # Update topology so Rule 1 is accurate for subsequent pairs
         bridge = Gate('BUF',
-                      f'__spar_bridge_{len(shared_points)}',
+                      '__spar_bridge_{0}'.format(len(shared_points)),
                       eo_cp_net,
                       [best_net])
         nl.net_dst[best_net].append(bridge)
@@ -835,28 +837,28 @@ def run_spar(netlist_path,
     # Remaining OPs not consumed become conventional OPs
     conventional_ops = [n for n in op_list if n not in used_ec_ops]
 
-    # ── Step 7: Summary ───────────────────────────────────────
+    # -- Step 7: Summary ----------------------------------------
     print("\n[7/7] Results summary")
-    print(f"  Shared points inserted   : {len(shared_points)}")
-    print(f"  Conventional CPs remain  : {len(conventional_cps)}")
-    print(f"  Conventional OPs remain  : {len(conventional_ops)}")
+    print("  Shared points inserted   : {0}".format(len(shared_points)))
+    print("  Conventional CPs remain  : {0}".format(len(conventional_cps)))
+    print("  Conventional OPs remain  : {0}".format(len(conventional_ops)))
 
-    sp_ratio = len(shared_points) / max(len(eo_cps), 1) * 100
-    print(f"  SP ratio (of EO-CPs)     : {sp_ratio:.1f}%")
+    sp_ratio = len(shared_points) / float(max(len(eo_cps), 1)) * 100
+    print("  SP ratio (of EO-CPs)     : {0:.1f}%".format(sp_ratio))
 
     area_saving_est = len(shared_points) / \
-                      max(len(cp_list) + len(op_list), 1) * 100
-    print(f"  Estimated area reduction : ~{area_saving_est:.1f}% "
-          f"(of conventional TP logic)")
+                      float(max(len(cp_list) + len(op_list), 1)) * 100
+    print("  Estimated area reduction : ~{0:.1f}% "
+          "(of conventional TP logic)".format(area_saving_est))
 
     return shared_points, conventional_cps, conventional_ops, nl
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SECTION 10 — VERILOG PATCH GENERATOR
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+#  SECTION 10 - VERILOG PATCH GENERATOR
+# ===============================================================
 
-# Paper Fig. 3 — four shared point structures
+# Paper Fig. 3 - four shared point structures
 # TPEnable = 1 during test, 0 during functional operation
 # {eo_cp}_new replaces all downstream uses of {eo_cp}
 
@@ -865,7 +867,7 @@ SP_GATE_TEMPLATES = {
     # EO-CP line needs 0; EC-OP provides 0 directly
     # Structure: AND(EO-CP, NOT(AND(EC-OP, TPEnable)))
     1 : """\
-  // Shared Point Type 1 — AND direct
+  // Shared Point Type 1 -- AND direct
   // EO-CP={ecp}  EC-OP={eop}  CCreq={cc_req}  CCactual={cc_act}
   wire _sp{i}_ctrl, _sp{i}_out;
   and  _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
@@ -875,7 +877,7 @@ SP_GATE_TEMPLATES = {
     # Type 2: AND-type, inverted control
     # Structure: AND(EO-CP, NAND(EC-OP, TPEnable))
     2 : """\
-  // Shared Point Type 2 — AND inverted
+  // Shared Point Type 2 -- AND inverted
   // EO-CP={ecp}  EC-OP={eop}  CCreq={cc_req}  CCactual={cc_act}
   wire _sp{i}_ctrl, _sp{i}_out;
   nand _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
@@ -885,7 +887,7 @@ SP_GATE_TEMPLATES = {
     # Type 3: OR-type, direct control
     # Structure: OR(EO-CP, AND(EC-OP, TPEnable))
     3 : """\
-  // Shared Point Type 3 — OR direct
+  // Shared Point Type 3 -- OR direct
   // EO-CP={ecp}  EC-OP={eop}  CCreq={cc_req}  CCactual={cc_act}
   wire _sp{i}_ctrl, _sp{i}_out;
   and  _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
@@ -895,7 +897,7 @@ SP_GATE_TEMPLATES = {
     # Type 4: OR-type, inverted control
     # Structure: OR(EO-CP, NAND(EC-OP, TPEnable))
     4 : """\
-  // Shared Point Type 4 — OR inverted
+  // Shared Point Type 4 -- OR inverted
   // EO-CP={ecp}  EC-OP={eop}  CCreq={cc_req}  CCactual={cc_act}
   wire _sp{i}_ctrl, _sp{i}_out;
   nand _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
@@ -913,12 +915,12 @@ def generate_verilog_patch(shared_points, conventional_cps,
     before the endmodule keyword.
     """
     lines = [
-        "// ─────────────────────────────────────────────────────",
-        "// SPAR shared-point logic — auto-generated",
+        "// ---------------------------------------------------------",
+        "// SPAR shared-point logic -- auto-generated",
         "// Insert this block inside the top module,",
         "// before endmodule.",
         "// TPEnable: 1 = test mode, 0 = functional mode",
-        "// ─────────────────────────────────────────────────────",
+        "// ---------------------------------------------------------",
         "",
         "input TPEnable;   // add to module port list",
         "",
@@ -936,24 +938,23 @@ def generate_verilog_patch(shared_points, conventional_cps,
 
     # Conventional CPs still need dedicated drivers
     if conventional_cps:
-        lines.append("// ── Conventional CPs (no EC-OP pair found) ──")
+        lines.append("// -- Conventional CPs (no EC-OP pair found) --")
         for net, cp_type in conventional_cps:
             gate = 'or' if cp_type == 'OR' else 'and'
             lines.append(
-                f"  {gate} _conv_cp_{net} "
-                f"(_conv_{net}_out, {net}, TPEnable);  "
-                f"// {cp_type}-type CP")
+                "  {0} _conv_cp_{1} (_conv_{1}_out, {1}, TPEnable);  "
+                "// {2}-type CP".format(gate, net, cp_type))
         lines.append("")
 
     with open(output_path, 'w') as f:
         f.write('\n'.join(lines))
 
-    print(f"[+] Verilog patch → {output_path}")
+    print("[+] Verilog patch -> {0}".format(output_path))
 
 
-# ═══════════════════════════════════════════════════════════════
-#  SECTION 11 — JSON REPORT
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
+#  SECTION 11 - JSON REPORT
+# ===============================================================
 
 def write_json_report(shared_points, conventional_cps,
                       conventional_ops, output_path):
@@ -970,12 +971,12 @@ def write_json_report(shared_points, conventional_cps,
     }
     with open(output_path, 'w') as f:
         json.dump(report, f, indent=2)
-    print(f"[+] JSON report    → {output_path}")
+    print("[+] JSON report    -> {0}".format(output_path))
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 #  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════
+# ===============================================================
 
 if __name__ == '__main__':
     netlist_path = (sys.argv[1]

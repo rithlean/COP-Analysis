@@ -891,12 +891,12 @@ def run_spar(netlist_path,
 SP_GATE_TEMPLATES = {
     # Type 1: AND-type, direct control
     # EO-CP line needs 0; EC-OP provides 0 directly
-    # Structure: AND(EO-CP, NOT(AND(EC-OP, TPEnable)))
+    # Structure: OR(EO-CP, AND(EC-OP, TPEnable))
     1 : """\
   // Shared Point Type 1 -- AND direct
   // EO-CP={ecp}  EC-OP={eop}  CCreq={cc_req}  CCactual={cc_act}
   wire _sp{i}_ctrl, _sp{i}_out;
-  and  _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
+  or   _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
   and  _sp{i}_gate(_sp{i}_out,  {ecp}, _sp{i}_ctrl);
   // replace downstream uses of {ecp} with _sp{i}_out
 """,
@@ -921,12 +921,12 @@ SP_GATE_TEMPLATES = {
   // replace downstream uses of {ecp} with _sp{i}_out
 """,
     # Type 4: OR-type, inverted control
-    # Structure: OR(EO-CP, NAND(EC-OP, TPEnable))
+    # Structure: OR(EO-CP, NOR(EC-OP, TPEnable))
     4 : """\
   // Shared Point Type 4 -- OR inverted
   // EO-CP={ecp}  EC-OP={eop}  CCreq={cc_req}  CCactual={cc_act}
   wire _sp{i}_ctrl, _sp{i}_out;
-  nand _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
+  nor _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
   or   _sp{i}_gate(_sp{i}_out,  {ecp}, _sp{i}_ctrl);
   // replace downstream uses of {ecp} with _sp{i}_out
 """,

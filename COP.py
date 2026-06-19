@@ -1,1028 +1,928 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
-SPAR: Shared Point Insertion for Area Overhead Reduction
-Kim et al., IEEE TCAD Vol.41 No.11, 2022
+COP (Controllability/Observability Probability) implementation
+for SAED32nm gate-level Verilog netlists synthesized by Synopsys DC.
 
-Fully autonomous flow:
-  - Parses gate-level scan netlist (DC output)
-  - Computes COP controllability + observability
-  - Identifies CP/OP sites autonomously (no external tool needed)
-  - Runs cone analysis (Rule 1 + Rule 2)
-  - Runs controllability optimisation (Eq. 7/8)
-  - Emits Verilog patch with shared point gates
+Based on: Brglez et al., "Applications of testability analysis:
+From ATPG to critical delay path tracing," ITC 1984.
 
 Usage:
-  python 03_spar.py netlist/scan_netlist_flat.v [DTh] [cp_budget] [op_budget]
-
-  DTh        : difference threshold 0.0-1.0  (default 1.0, paper setting)
-  cp_budget  : max CPs as fraction of scan cells (default 0.05 = 5%)
-  op_budget  : max OPs as fraction of scan cells (default 0.05 = 5%)
+    python cop.py s9234.v [--tp_file s9234_tp_analysis.txt]
 """
 
-from __future__ import print_function, division
-
-import re, json, sys, math, os
+import re
+import sys
 from collections import defaultdict, deque
 
-# ===============================================================
-#  SECTION 1 - DATA STRUCTURES
-# ===============================================================
+# ---------------------------------------------------------------------------
+# 1.  CELL TYPE -> COP FORMULA
+#     Each entry maps a cell base-name to:
+#       inputs  : list of logical input port names
+#       output  : logical output port name
+#       cc1(ins): 1-controllability formula  (product / sum rules)
+#       co(out, ins, co_out): observability formula
+#
+#     COP rules (Brglez 1984):
+#       AND  : cc1 = prod(cc1_i)       co_i = co_out * prod_{j!=i}(cc1_j)
+#       OR   : cc1 = 1-prod(cc0_i)     co_i = co_out * prod_{j!=i}(cc0_j)
+#       NAND : cc1 = 1-prod(cc1_i)     co_i = co_out * prod_{j!=i}(cc1_j)
+#       NOR  : cc1 = prod(cc0_i)       co_i = co_out * prod_{j!=i}(cc0_j)
+#       INV  : cc1 = cc0_in = 1-cc1_in co_i = co_out
+#       BUF  : cc1 = cc1_in            co_i = co_out
+#       XOR  (2-in): cc1=cc1_a*cc0_b + cc0_a*cc1_b
+#       XNOR (2-in): cc1=cc1_a*cc1_b + cc0_a*cc0_b
+#       MUX  (A1,A2,S0->Y): handled explicitly
+#       HADD (A0,B0->SO,CO): handled explicitly
+#       FADD (A,B,CI->S,CO): handled explicitly
+# ---------------------------------------------------------------------------
 
-class Gate(object):
-    __slots__ = ('gtype','name','output','inputs')
-    def __init__(self, gtype, name, output, inputs):
-        self.gtype   = gtype    # canonical type string
-        self.name    = name
-        self.output  = output   # single output net name
-        self.inputs  = inputs   # list[str] of input net names
+def prod(vals):
+    r = 1.0
+    for v in vals:
+        r *= v
+    return r
 
-class Netlist(object):
-    def __init__(self):
-        self.gates    = {}                   # name  -> Gate
-        self.net_src  = {}                   # net   -> Gate (driver)
-        self.net_dst  = defaultdict(list)    # net   -> [Gate] (sinks)
-        self.pis      = []                   # primary input net names
-        self.pos      = []                   # primary output net names
-        self.scan_ffs = []                   # scan FF output nets (PPIs)
-        self.scan_din = []                   # scan FF D-input nets (PPOs)
-        self.all_nets = set()
-
-    # -- Traversal helpers --------------------------------------
-
-    def fanout_cone(self, start_net, stop_at_ff=True):
-        """BFS forward from start_net. Returns set of reachable nets."""
-        visited = set()
-        queue   = deque([start_net])
-        while queue:
-            net = queue.popleft()
-            if net in visited:
-                continue
-            visited.add(net)
-            for g in self.net_dst.get(net, []):
-                if stop_at_ff and g.gtype == 'DFF':
-                    continue
-                if g.output not in visited:
-                    queue.append(g.output)
-        return visited
-
-    def fanin_cone(self, start_net, stop_at_ff=True):
-        """BFS backward from start_net. Returns set of reachable nets."""
-        visited = set()
-        queue   = deque([start_net])
-        while queue:
-            net = queue.popleft()
-            if net in visited:
-                continue
-            visited.add(net)
-            g = self.net_src.get(net)
-            if g is None:
-                continue
-            if stop_at_ff and g.gtype == 'DFF':
-                continue
-            for inp in g.inputs:
-                if inp not in visited:
-                    queue.append(inp)
-        return visited
+def clamp(v):
+    return max(0.0, min(1.0, v))
 
 
-# ===============================================================
-#  SECTION 2 - GATE-LEVEL VERILOG PARSER
-# ===============================================================
+# ---------------------------------------------------------------------------
+# 2.  NETLIST PARSER
+# ---------------------------------------------------------------------------
 
-# Map substrings in cell names to canonical gate types.
-# Add your library's cell name patterns here.
-# Order matters - more specific patterns first.
-CELL_TYPE_MAP = [
-    # -- Flip-flops ---------------------------------------------
-    # Must come before any AND/OR/XOR patterns to avoid false matches
-    ('SDFFARX',  'DFF'),   # scan FF with async reset (SDFFARX1_LVT)
-    ('SDFF',     'DFF'),
-    ('DFF',      'DFF'),
-
-    # -- Half-adder (before XOR so HADD is not caught by XOR) --
-    ('HADD',     'XOR'),   # HADDX1_LVT: SO=XOR output, C1=AND carry
-
-    # -- Complex cells: more specific patterns first ------------
-    # AND-OR-Invert
-    ('AOI222',   'NAND'),
-    ('AOI22',    'NAND'),
-    ('AOI21',    'NAND'),
-    # AND-OR
-    ('AO222',    'AND'),
-    ('AO221',    'AND'),
-    ('AO22',     'AND'),
-    ('AO21',     'AND'),
-    # OR-AND
-    ('OA221',    'OR'),
-    ('OA21',     'OR'),
-
-    # -- Standard logic (2/3/4-input variants) ------------------
-    # XNOR before XOR, NOR before OR, NAND before AND
-    ('XNOR',     'XNOR'),  # XNOR2X1_LVT
-    ('XOR3',     'XOR'),   # XOR3X1_LVT  (3-input)
-    ('XOR2',     'XOR'),   # XOR2X1_LVT
-    ('XOR',      'XOR'),   # catch-all
-    ('NAND',     'NAND'),  # NAND2X0_LVT, NAND3X0_LVT ...
-    ('NOR',      'NOR'),   # NOR2X0_LVT, NOR3X0_LVT, NOR4X1_LVT ...
-    ('AND',      'AND'),   # AND2X1_LVT, AND3X1_LVT ...
-    ('OR',       'OR'),    # OR2X1_LVT, OR3X1_LVT ...
-
-    # -- Inverters / Buffers ------------------------------------
-    ('INVX',     'NOT'),   # INVX0_LVT, INVX8_LVT
-    ('NBUFF',    'BUF'),   # NBUFFX2_LVT, NBUFFX4_LVT
-    ('BUF',      'BUF'),
-
-    # -- MUX ----------------------------------------------------
-    ('MUX21',    'MUX'),   # MUX21X1_LVT: ports A1, A2, S0 -> Y
-]
-
-# Port names that carry the output of a gate.
-# ORDER MATTERS: use a list so Q is checked before QN for DFFs.
-# (A set gives no iteration-order guarantee in Python 2/3.)
-OUTPUT_PORTS_ORDERED = ['Q', 'QN', 'Y', 'SO', 'C1']
-
-# Keep a set for fast membership tests elsewhere
-OUTPUT_PORTS = set(OUTPUT_PORTS_ORDERED)
-
-
-def canonical_type(cell_name):
-    upper = cell_name.upper()
-    for pattern, ctype in CELL_TYPE_MAP:
-        if pattern in upper:
-            return ctype
-    return 'UNKNOWN'
-
-
-def parse_port_list(port_str):
+def parse_verilog(filename):
     """
-    Parse .port(net) style connections into dict.
-    Handles plain names (n42), bus names (stato[0]),
-    and DC escaped identifiers (\stato_reg[0] ).
-    """
-    ports = {}
-    # Net name: optional backslash, word chars, optional [index],
-    # followed by optional whitespace (escaped ids end with a space in DC)
-    net_pat = r'(\\[\w\[\]./]+ *|[\w]+(?:\[\d+\])?)'
-    pat = re.compile(r'\.(\w+)\s*\(\s*' + net_pat + r'\s*\)')
-    for m in pat.finditer(port_str):
-        port = m.group(1)
-        net  = m.group(2).strip()
-        ports[port] = net
-    return ports
-
-
-def parse_verilog(filepath):
-    """
-    Gate-level Verilog parser for DC-generated netlists.
-    Handles:
-      - Single or multi-module files (takes top-level module)
-      - input/output/wire declarations with optional bus widths
-      - Named port connections (.port(net) style)
-      - MUX-based scan flip-flops
-    """
-    nl = Netlist()
-
-    with open(filepath) as f:
-        raw = f.read()
-
-    # Strip comments
-    raw = re.sub(r'//[^\n]*', '', raw)
-    raw = re.sub(r'/\*.*?\*/', '', raw, flags=re.DOTALL)
-
-    # Find top-level module (last module or only module)
-    modules = list(re.finditer(
-        r'\bmodule\s+(\w+)\s*(?:\([^)]*\))?\s*;(.*?)endmodule',
-        raw, re.DOTALL))
-
-    if not modules:
-        raise ValueError("No module found in {0}".format(filepath))
-
-    # Use the last module (usually the top after flattening)
-    mod_body = modules[-1].group(2)
-
-    # -- Port declarations --------------------------------------
-    def extract_signals(keyword, body):
-        sigs = []
-        for m in re.finditer(
-                r'\b' + keyword + r'\b\s*(?:\[\s*\d+\s*:\s*\d+\s*\])?\s*([\w\s,]+?)\s*;',
-                body):
-            for sig in re.split(r'[\s,]+', m.group(1)):
-                sig = sig.strip()
-                if sig:
-                    sigs.append(sig)
-        return sigs
-
-    nl.pis = extract_signals('input',  mod_body)
-    nl.pos = extract_signals('output', mod_body)
-
-    # -- Gate instances -----------------------------------------
-    # Pattern: CellType  InstanceName  ( .port(net), ... ) ;
-    # Instance names can be escaped: \stato_reg[0]  (ends at whitespace)
-    inst_re = re.compile(
-        r'(\w+)\s+(\\[^\s(]+|\w+)\s*\(([^;]*?)\)\s*;', re.DOTALL)
-
-    # Ports that are never data inputs: clocks, resets, scan enable, scan in
-    NON_DATA_PORTS = {'CLK', 'CK', 'RSTB', 'RST', 'RB', 'RN',
-                      'SE', 'SI', 'SIN', 'TE', 'TI'}
-
-    for m in inst_re.finditer(mod_body):
-        cell_name = m.group(1)
-        inst_name = m.group(2)
-        port_str  = m.group(3)
-
-        # Skip keywords that look like instances
-        if cell_name in ('module','input','output','wire',
-                         'reg','assign','always','if','else'):
-            continue
-
-        ctype = canonical_type(cell_name)
-        if ctype == 'UNKNOWN':
-            # Uncomment the line below to debug unrecognised cells:
-            # print("  WARNING: unrecognised cell '{0}' (instance '{1}') -- skipped".format(cell_name, inst_name))
-            continue
-
-        ports = parse_port_list(port_str)
-        # Normalise MUX21X1_LVT ports to canonical D0, D1, SEL naming
-        if 'S0' in ports:
-            ports['SEL'] = ports.pop('S0')
-        if 'A1' in ports and 'A2' in ports and 'SEL' in ports:
-            ports['D0'] = ports.pop('A1')
-            ports['D1'] = ports.pop('A2')
-
-        if not ports:
-            continue
-
-        # Find output net — iterate the ordered list so Q wins over QN
-        out_net = None
-        for op in OUTPUT_PORTS_ORDERED:
-            if op in ports and ports[op]:
-                out_net = ports[op]
-                break
-
-        if out_net is None:
-            # Fallback: last port is often output
-            vals = list(ports.values())
-            if vals:
-                out_net = vals[-1]
-            else:
-                continue
-
-        inp_nets = [v for k, v in ports.items()
-                    if k not in OUTPUT_PORTS
-                    and k not in NON_DATA_PORTS
-                    and v and v != out_net]
-
-        g = Gate(ctype, inst_name, out_net, inp_nets)
-        nl.gates[inst_name] = g
-        nl.net_src[out_net] = g
-        for inp in inp_nets:
-            nl.net_dst[inp].append(g)
-        nl.all_nets.add(out_net)
-        nl.all_nets.update(inp_nets)
-
-        # HADD has two outputs: SO (sum, already captured above)
-        # and C1 (carry). Register C1 as a separate AND gate.
-        if ctype == 'XOR' and 'C1' in ports and ports.get('C1'):
-            carry_net  = ports['C1']
-            carry_gate = Gate('AND',
-                              inst_name + '_carry',
-                              carry_net,
-                              inp_nets)
-            nl.gates[inst_name + '_carry'] = carry_gate
-            nl.net_src[carry_net]          = carry_gate
-            for inp in inp_nets:
-                nl.net_dst[inp].append(carry_gate)
-            nl.all_nets.add(carry_net)
-
-        # Track scan FFs
-        if ctype == 'DFF':
-            nl.scan_ffs.append(out_net)        # Q output = PPI
-            # Prefer the explicit D port; fall back to first input net
-            d_net = ports.get('D') or ports.get('d')
-            if d_net and d_net in inp_nets:
-                nl.scan_din.append(d_net)
-            elif inp_nets:
-                nl.scan_din.append(inp_nets[0])
-
-    print("  Parsed: {0} gates, {1} PIs, {2} scan FFs".format(
-        len(nl.gates), len(nl.pis), len(nl.scan_ffs)))
-    return nl
-
-
-# ===============================================================
-#  SECTION 3 - COP TESTABILITY (Paper Section II-A)
-# ===============================================================
-
-def compute_cop(nl):
-    """
-    COP algorithm.
-    CC[net] = probability net = logic-1 under uniform random inputs.
-    CO[net] = probability a fault on net propagates to a PO or scan FF D-pin.
-
-    PIs and scan FF outputs (PPIs) initialised to 0.5.
-    POs and scan FF D-inputs (PPOs) have observability 1.0.
-    """
-
-    CC = {}
-    CO = {}
-
-    # -- Initialise ---------------------------------------------
-    for pi  in nl.pis:      CC[pi]  = 0.5
-    for ppi in nl.scan_ffs: CC[ppi] = 0.5   # FF output treated as random
-    for po  in nl.pos:      CO[po]  = 1.0
-    for ppo in nl.scan_din: CO[ppo] = 1.0   # FF D-input is observable
-
-    # -- Forward pass: compute CC via topological BFS -----------
-    # Repeat until stable (handles reconvergent fanouts approximately)
-    MAX_ITER = 500
-    for _ in range(MAX_ITER):
-        changed = False
-        for g in nl.gates.values():
-            if not all(i in CC for i in g.inputs):
-                continue
-            ins = [CC[i] for i in g.inputs]
-            t   = g.gtype
-
-            if   t == 'AND':
-                cc = 1.0
-                for v in ins: cc *= v
-            elif t == 'OR':
-                cc = 1.0
-                for v in ins: cc *= (1.0 - v)
-                cc = 1.0 - cc
-            elif t == 'NAND':
-                cc = 1.0
-                for v in ins: cc *= v
-                cc = 1.0 - cc
-            elif t == 'NOR':
-                cc = 1.0
-                for v in ins: cc *= (1.0 - v)
-            elif t == 'NOT':
-                cc = 1.0 - ins[0]
-            elif t == 'BUF':
-                cc = ins[0]
-            elif t == 'XOR':
-                cc = ins[0]
-                for v in ins[1:]:
-                    cc = cc * (1.0 - v) + (1.0 - cc) * v
-            elif t == 'XNOR':
-                cc = ins[0]
-                for v in ins[1:]:
-                    cc = cc * (1.0 - v) + (1.0 - cc) * v
-                cc = 1.0 - cc
-            elif t == 'MUX':
-                # D0, D1, SEL  ->  out = SEL?D1:D0
-                if len(ins) >= 3:
-                    d0, d1, sel = ins[0], ins[1], ins[2]
-                    cc = sel * d1 + (1.0 - sel) * d0
-                else:
-                    cc = 0.5
-            elif t == 'DFF':
-                cc = 0.5    # output already seeded; skip
-            else:
-                cc = 0.5
-
-            cc = max(1e-9, min(1.0 - 1e-9, cc))
-            if abs(CC.get(g.output, -1) - cc) > 1e-10:
-                CC[g.output] = cc
-                changed = True
-
-        if not changed:
-            break
-
-    # -- Backward pass: compute CO ------------------------------
-    for _ in range(MAX_ITER):
-        changed = False
-        for g in nl.gates.values():
-            if g.output not in CO:
-                continue
-            co_out = CO[g.output]
-            ins_cc = [CC.get(i, 0.5) for i in g.inputs]
-            t      = g.gtype
-
-            for idx, inp in enumerate(g.inputs):
-                others = [ins_cc[j] for j in range(len(ins_cc))
-                          if j != idx]
-
-                if   t in ('AND', 'NAND'):
-                    # Sensitise: all other inputs must be 1
-                    sens = 1.0
-                    for v in others: sens *= v
-                elif t in ('OR', 'NOR'):
-                    # Sensitise: all other inputs must be 0
-                    sens = 1.0
-                    for v in others: sens *= (1.0 - v)
-                elif t in ('NOT', 'BUF'):
-                    sens = 1.0
-                elif t in ('XOR', 'XNOR'):
-                    # XOR always sensitisable (parity gate)
-                    sens = 1.0
-                elif t == 'MUX':
-                    if len(ins_cc) >= 3:
-                        sel = ins_cc[2]
-                        if   idx == 0: sens = 1.0 - sel
-                        elif idx == 1: sens = sel
-                        else:          sens = abs(ins_cc[0] - ins_cc[1])
-                    else:
-                        sens = 0.5
-                elif t == 'DFF':
-                    sens = 1.0   # D-input is observable
-                else:
-                    sens = 0.5
-
-                new_co = co_out * sens
-                if new_co > CO.get(inp, 0.0) + 1e-12:
-                    CO[inp] = new_co
-                    changed = True
-
-        if not changed:
-            break
-
-    return CC, CO
-
-
-# ===============================================================
-#  SECTION 4 - AUTONOMOUS CP/OP SITE IDENTIFICATION
-# ===============================================================
-
-def identify_cp_op_sites(nl, CC, CO, cp_budget_frac=0.05,
-                          op_budget_frac=0.05):
-    """
-    Autonomous identification of CP and OP sites using COP metrics.
-    Mirrors the conventional TPI step in the paper's Fig. 4.
-
-    CP sites: internal nets with low controllability
-              (hard-to-1 -> OR-type, hard-to-0 -> AND-type)
-    OP sites: internal nets with low observability
-
-    Budget: paper limits each to 5% of scan cell count.
+    Parse a flat gate-level Verilog netlist produced by Synopsys DC.
     Returns:
-      cp_list: [(net, 'AND'|'OR'), ...]
-      op_list: [net, ...]
+        ports_in  : set of input port net names
+        ports_out : set of output port net names
+        instances : list of dicts with keys:
+                      cell, inst, connections {port: net}
+        assigns   : list of (lhs_net, rhs_net)
     """
-    n_scan   = max(len(nl.scan_ffs), 1)
-    cp_limit = max(1, int(n_scan * cp_budget_frac))
-    op_limit = max(1, int(n_scan * op_budget_frac))
-
-    # Only consider internal combinational nets (not PIs/POs/FF outputs)
-    excluded = set(nl.pis) | set(nl.pos) | \
-               set(nl.scan_ffs) | set(nl.scan_din)
-
-    internal_nets = [n for n in nl.all_nets if n not in excluded]
-
-    # -- CP candidates: sort by distance from 0.5 (most biased first) --
-    def cp_score(net):
-        cc = CC.get(net, 0.5)
-        return abs(cc - 0.5)   # higher = more biased = harder to control
-
-    cp_candidates = sorted(internal_nets,
-                           key=cp_score, reverse=True)
-
-    cp_list = []
-    for net in cp_candidates:
-        if len(cp_list) >= cp_limit:
-            break
-        cc = CC.get(net, 0.5)
-        # Skip nets that are already near-0.5 (not truly hard-to-control)
-        if abs(cc - 0.5) < 0.05:
-            continue
-        cp_type = 'OR' if cc < 0.5 else 'AND'
-        cp_list.append((net, cp_type))
-
-    # -- OP candidates: sort by ascending observability ---------
-    op_candidates = sorted(internal_nets,
-                           key=lambda n: CO.get(n, 0.0))
-
-    op_list = []
-    for net in op_candidates:
-        if len(op_list) >= op_limit:
-            break
-        co = CO.get(net, 0.0)
-        # Skip nets that are already easily observable
-        if co > 0.1:
-            break
-        op_list.append(net)
-
-    print("  CP sites identified : {0} (budget {1}, {2:.0f}% of {3} scan FFs)".format(
-        len(cp_list), cp_limit, cp_budget_frac * 100, n_scan))
-    print("  OP sites identified : {0} (budget {1})".format(
-        len(op_list), op_limit))
-    return cp_list, op_list
-
-
-# ===============================================================
-#  SECTION 5 - THRESHOLD COMPUTATION (Paper Eq. 5 & 6)
-# ===============================================================
-
-def compute_thresholds(cp_list, op_list, CC, CO):
-    """
-    CCTh = max(avg CC of OR-CPs,  avg (1-CC) of AND-CPs)   Eq. 5
-    COTh = avg CO of OPs                                    Eq. 6
-    """
-    or_cc  = [CC.get(n, 0.5)       for n, t in cp_list if t == 'OR']
-    and_cc = [1.0 - CC.get(n, 0.5) for n, t in cp_list if t == 'AND']
-
-    avg_or  = sum(or_cc)  / max(len(or_cc),  1)
-    avg_and = sum(and_cc) / max(len(and_cc), 1)
-    CCTh    = max(avg_or, avg_and)
-
-    op_co  = [CO.get(n, 0.0) for n in op_list]
-    COTh   = sum(op_co) / max(len(op_co), 1)
-
-    return CCTh, COTh
-
-
-# ===============================================================
-#  SECTION 6 - CANDIDATE IDENTIFICATION (Paper Section IV)
-# ===============================================================
-
-def identify_shared_candidates(cp_list, op_list, CC, CO,
-                                CCTh, COTh):
-    """
-    EO-CPs : CP lines where CO > COTh  (easily observable)
-    EC-OPs : OP lines where CCTh <= CC <= 1-CCTh  (easily controllable)
-    """
-    eo_cps = [(net, t) for net, t in cp_list
-              if CO.get(net, 0.0) > COTh]
-
-    ec_ops = [net for net in op_list
-              if CCTh <= CC.get(net, 0.5) <= 1.0 - CCTh]
-
-    print("  EO-CPs : {0} / {1}".format(len(eo_cps), len(cp_list)))
-    print("  EC-OPs : {0} / {1}".format(len(ec_ops), len(op_list)))
-    return eo_cps, ec_ops
-
-
-# ===============================================================
-#  SECTION 7 - CONE ANALYSIS (Paper Section V)
-# ===============================================================
-
-def check_rule1(nl, eo_cp_net, ec_op_net):
-    """
-    Rule 1: EC-OP must NOT be in the fanout cone of EO-CP.
-    Prevents combinational loop generation.
-    Verified after every insertion (topology changes with each SP).
-    """
-    fanout = nl.fanout_cone(eo_cp_net)
-    return ec_op_net not in fanout      # True = safe to pair
-
-
-def check_rule2(nl, eo_cp_net, ec_op_net, cp_type, CC,
-                direct):
-    """
-    Rule 2: injecting the control value onto ec_op_net must not
-    block fault propagation through the blocked cone of eo_cp_net.
-
-    Returns True if this control scheme is safe.
-    """
-    # Determine which value drives the shared point
-    # OR-type CP: needs 1 on control line to activate  (Fig. 3c/d)
-    # AND-type CP: needs 0 on control line to activate (Fig. 3a/b)
-    if cp_type == 'OR':
-        ctrl_val = 1.0 if direct else 0.0
-    else:
-        ctrl_val = 0.0 if direct else 1.0
-
-    # Temporarily propagate ctrl_val forward from ec_op_net
-    temp_CC = dict(CC)
-    temp_CC[ec_op_net] = ctrl_val
-
-    queue   = deque(nl.net_dst.get(ec_op_net, []))
-    visited = set()
-
-    while queue:
-        g = queue.popleft()
-        if g.name in visited:
-            continue
-        visited.add(g.name)
-        if g.gtype == 'DFF':
-            continue
-
-        ins = [temp_CC.get(i, CC.get(i, 0.5)) for i in g.inputs]
-        t   = g.gtype
-
-        new_val = None
-        if   t in ('AND', 'NAND'):
-            if all(v > 0.99 for v in ins):
-                new_val = 0.0 if t == 'NAND' else 1.0
-            elif any(v < 0.01 for v in ins):
-                new_val = 1.0 if t == 'NAND' else 0.0
-        elif t in ('OR', 'NOR'):
-            if any(v > 0.99 for v in ins):
-                new_val = 0.0 if t == 'NOR' else 1.0
-            elif all(v < 0.01 for v in ins):
-                new_val = 1.0 if t == 'NOR' else 0.0
-        elif t == 'NOT':
-            new_val = 1.0 - ins[0] if ins else None
-        elif t == 'BUF':
-            new_val = ins[0] if ins else None
-
-        if new_val is not None:
-            temp_CC[g.output] = new_val
-            for ng in nl.net_dst.get(g.output, []):
-                if ng.name not in visited:
-                    queue.append(ng)
-
-    # Check observability of eo_cp_net's direct fanout gates
-    # under the modified controllabilities
-    direct_sinks = nl.net_dst.get(eo_cp_net, [])
-    if not direct_sinks:
-        return True   # no fanout -- no blocking possible
-
-    any_unblocked = False
-    for sink_gate in direct_sinks:
-        if sink_gate.gtype == 'DFF':
-            any_unblocked = True
-            continue
-        # Compute sensitisation probability through this gate
-        other_ins = [temp_CC.get(i, CC.get(i, 0.5))
-                     for i in sink_gate.inputs
-                     if i != eo_cp_net]
-        t = sink_gate.gtype
-
-        if t in ('AND', 'NAND'):
-            # All others must be 1 to sensitise
-            sens = 1.0
-            for v in other_ins: sens *= v
-        elif t in ('OR', 'NOR'):
-            # All others must be 0 to sensitise
-            sens = 1.0
-            for v in other_ins: sens *= (1.0 - v)
-        elif t in ('NOT', 'BUF', 'XOR', 'XNOR'):
-            sens = 1.0
-        else:
-            sens = 0.5
-
-        if sens > 1e-6:
-            any_unblocked = True
-            break
-
-    return any_unblocked     # True = at least one path unblocked
-
-
-# ===============================================================
-#  SECTION 8 - CONTROLLABILITY OPTIMISATION (Paper Section VI)
-# ===============================================================
-
-def compute_cc_req(nl, eo_cp_net, cp_type):
-    """
-    Eq. 7  OR-type  : CCreq = Bx / (bx + Bx + Fx)
-    Eq. 8  AND-type : CCreq = (Bx + Fx) / (bx + Bx + Fx)
-
-    bx = faults blocked when eo_cp_net = 1
-         (gates in direct fanout that are dominated by 1)
-    Bx = faults blocked when eo_cp_net = 0
-         (gates in direct fanout that are dominated by 0)
-    Fx = faults propagating through eo_cp_net (fanout cone size)
-
-    Approximation: use fanout cone sizes as fault count proxies,
-    consistent with the paper's notation in Section VI.
-    """
-    fanout_total = len(nl.fanout_cone(eo_cp_net))
-    direct_sinks = nl.net_dst.get(eo_cp_net, [])
-
-    bx = 0   # blocked when net=1  (OR/NOR dominated)
-    Bx = 0   # blocked when net=0  (AND/NAND dominated)
-
-    for g in direct_sinks:
-        if g.gtype == 'DFF':
-            continue
-        cone_size = len(nl.fanout_cone(g.output))
-        if g.gtype in ('OR', 'NOR'):
-            # eo_cp=1 dominates OR -> blocks propagation of other faults
-            bx += cone_size
-        elif g.gtype in ('AND', 'NAND'):
-            # eo_cp=0 dominates AND -> blocks propagation
-            Bx += cone_size
-
-    Fx    = max(fanout_total - bx - Bx, 0)
-    total = bx + Bx + Fx
-
-    if total == 0:
-        return 0.5
-
-    if cp_type == 'OR':
-        return Bx / float(total)                   # Eq. 7
-    else:
-        return (Bx + Fx) / float(total)            # Eq. 8
-
-
-def select_best_ec_op(candidate_nets, cc_req, CC, DTh=1.0):
-    """
-    Select EC-OP whose controllability (direct or inverted)
-    is closest to cc_req, within DTh tolerance (Eq. 9).
-    Returns (net, use_inverted) or (None, None).
-    """
-    best_net  = None
-    best_inv  = False
-    best_diff = float('inf')
-
-    for net in candidate_nets:
-        cc      = CC.get(net, 0.5)
-        d_dir   = abs(cc_req - cc)
-        d_inv   = abs(cc_req - (1.0 - cc))
-
-        if d_dir <= d_inv and d_dir < best_diff:
-            best_diff, best_net, best_inv = d_dir, net, False
-        elif d_inv < d_dir and d_inv < best_diff:
-            best_diff, best_net, best_inv = d_inv, net, True
-
-    if best_net is None or best_diff >= DTh:
-        return None, None
-
-    return best_net, best_inv
-
-
-# ===============================================================
-#  SECTION 9 - MAIN SPAR FLOW (Paper Fig. 4)
-# ===============================================================
-
-def run_spar(netlist_path,
-             DTh=1.0,
-             cp_budget=0.05,
-             op_budget=0.05):
-
-    print("\n" + "="*55)
-    print(" SPAR: Shared Point Insertion for Area Overhead Reduction")
-    print("="*55)
-
-    # -- Step 1: Parse netlist ----------------------------------
-    print("\n[1/7] Parsing netlist ...")
-    nl = parse_verilog(netlist_path)
-
-    # -- Step 2: COP analysis -----------------------------------
-    print("\n[2/7] COP testability analysis ...")
-    CC, CO = compute_cop(nl)
-    print("  CC computed for {0} nets".format(len(CC)))
-    print("  CO computed for {0} nets".format(len(CO)))
-
-    # -- Step 3: CP/OP site identification ---------------------
-    print("\n[3/7] Autonomous CP/OP site identification ...")
-    cp_list, op_list = identify_cp_op_sites(
-        nl, CC, CO, cp_budget, op_budget)
-
-    # -- Step 4: Threshold computation -------------------------
-    print("\n[4/7] Computing EO-CP / EC-OP thresholds ...")
-    CCTh, COTh = compute_thresholds(cp_list, op_list, CC, CO)
-    print("  CCTh = {0:.6f}".format(CCTh))
-    print("  COTh = {0:.6f}".format(COTh))
-
-    # -- Step 5: Shared point candidates -----------------------
-    print("\n[5/7] Identifying shared point candidates ...")
-    eo_cps, ec_ops = identify_shared_candidates(
-        cp_list, op_list, CC, CO, CCTh, COTh)
-
-    # -- Step 6: Pairing ----------------------------------------
-    print("\n[6/7] Pairing (cone analysis + ctrl optimisation) ...")
-
-    shared_points = []
-    used_ec_ops   = set()
-    conventional_cps  = []   # EO-CPs that could not find a pair
-    conventional_ops  = []   # EC-OPs that were not consumed
-
-    for eo_cp_net, cp_type in eo_cps:
-        cc_req = compute_cc_req(nl, eo_cp_net, cp_type)
-
-        # Build valid candidate list for this EO-CP
-        valid = []
-        for ec_op_net in ec_ops:
-            if ec_op_net in used_ec_ops:
-                continue
-
-            # Rule 1: no combinational loop
-            if not check_rule1(nl, eo_cp_net, ec_op_net):
-                continue
-
-            # Rule 2: check both control schemes
-            ok_direct   = check_rule2(nl, eo_cp_net, ec_op_net,
-                                      cp_type, CC, direct=True)
-            ok_inverted = check_rule2(nl, eo_cp_net, ec_op_net,
-                                      cp_type, CC, direct=False)
-
-            if ok_direct or ok_inverted:
-                valid.append((ec_op_net, ok_direct, ok_inverted))
-
-        if not valid:
-            conventional_cps.append((eo_cp_net, cp_type))
-            continue
-
-        # Filter to nets with at least one valid scheme
-        valid_nets = [n for n, od, oi in valid]
-
-        best_net, use_inv = select_best_ec_op(
-            valid_nets, cc_req, CC, DTh)
-
-        if best_net is None:
-            conventional_cps.append((eo_cp_net, cp_type))
-            continue
-
-        # Determine control scheme validity for chosen net
-        ok_d = next((od for n, od, oi in valid if n == best_net), False)
-        ok_i = next((oi for n, od, oi in valid if n == best_net), False)
-
-        # If use_inv conflicts with rule2, override
-        if use_inv and not ok_i:
-            use_inv = False
-        elif not use_inv and not ok_d:
-            use_inv = True
-
-        # Shared point type (paper Fig. 3):
-        #   AND + direct   = Type 1
-        #   AND + inverted = Type 2
-        #   OR  + direct   = Type 3
-        #   OR  + inverted = Type 4
-        if   cp_type == 'AND' and not use_inv: sp_type = 1
-        elif cp_type == 'AND' and use_inv:     sp_type = 2
-        elif cp_type == 'OR'  and not use_inv: sp_type = 3
-        else:                                  sp_type = 4
-
-        cc_actual = (1.0 - CC.get(best_net, 0.5)) \
-                    if use_inv else CC.get(best_net, 0.5)
-
-        sp = {
-            'eo_cp_net' : eo_cp_net,
-            'ec_op_net' : best_net,
-            'cp_type'   : cp_type,
-            'sp_type'   : sp_type,
-            'inverted'  : use_inv,
-            'cc_req'    : round(cc_req,    6),
-            'cc_actual' : round(cc_actual, 6),
-            'cc_diff'   : round(abs(cc_req - cc_actual), 6),
-        }
-        shared_points.append(sp)
-        used_ec_ops.add(best_net)
-
-        # Update topology so Rule 1 is accurate for subsequent pairs
-        bridge = Gate('BUF',
-                      '__spar_bridge_{0}'.format(len(shared_points)),
-                      eo_cp_net,
-                      [best_net])
-        nl.net_dst[best_net].append(bridge)
-
-    # Remaining OPs not consumed become conventional OPs
-    conventional_ops = [n for n in op_list if n not in used_ec_ops]
-
-    # -- Step 7: Summary ----------------------------------------
-    print("\n[7/7] Results summary")
-    print("  Shared points inserted   : {0}".format(len(shared_points)))
-    print("  Conventional CPs remain  : {0}".format(len(conventional_cps)))
-    print("  Conventional OPs remain  : {0}".format(len(conventional_ops)))
-
-    sp_ratio = len(shared_points) / float(max(len(eo_cps), 1)) * 100
-    print("  SP ratio (of EO-CPs)     : {0:.1f}%".format(sp_ratio))
-
-    area_saving_est = len(shared_points) / \
-                      float(max(len(cp_list) + len(op_list), 1)) * 100
-    print("  Estimated area reduction : ~{0:.1f}% "
-          "(of conventional TP logic)".format(area_saving_est))
-
-    return shared_points, conventional_cps, conventional_ops, nl
-
-
-# ===============================================================
-#  SECTION 10 - VERILOG PATCH GENERATOR
-# ===============================================================
-
-# Paper Fig. 3 - four shared point structures
-# TPEnable = 1 during test, 0 during functional operation
-# {eo_cp}_new replaces all downstream uses of {eo_cp}
-
-SP_GATE_TEMPLATES = {
-    # Type 1: AND-type, direct control
-    # EO-CP line needs 0; EC-OP provides 0 directly
-    # Structure: OR(EO-CP, AND(EC-OP, TPEnable))
-    1 : """\
-  // Shared Point Type 1 -- AND direct
-  // EO-CP={ecp}  EC-OP={eop}  CCreq={cc_req}  CCactual={cc_act}
-  wire _sp{i}_ctrl, _sp{i}_out;
-  or   _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
-  and  _sp{i}_gate(_sp{i}_out,  {ecp}, _sp{i}_ctrl);
-  // replace downstream uses of {ecp} with _sp{i}_out
-""",
-    # Type 2: AND-type, inverted control
-    # Structure: AND(EO-CP, NAND(EC-OP, TPEnable))
-    2 : """\
-  // Shared Point Type 2 -- AND inverted
-  // EO-CP={ecp}  EC-OP={eop}  CCreq={cc_req}  CCactual={cc_act}
-  wire _sp{i}_ctrl, _sp{i}_out;
-  nand _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
-  and  _sp{i}_gate(_sp{i}_out,  {ecp}, _sp{i}_ctrl);
-  // replace downstream uses of {ecp} with _sp{i}_out
-""",
-    # Type 3: OR-type, direct control
-    # Structure: OR(EO-CP, AND(EC-OP, TPEnable))
-    3 : """\
-  // Shared Point Type 3 -- OR direct
-  // EO-CP={ecp}  EC-OP={eop}  CCreq={cc_req}  CCactual={cc_act}
-  wire _sp{i}_ctrl, _sp{i}_out;
-  and  _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
-  or   _sp{i}_gate(_sp{i}_out,  {ecp}, _sp{i}_ctrl);
-  // replace downstream uses of {ecp} with _sp{i}_out
-""",
-    # Type 4: OR-type, inverted control
-    # Structure: OR(EO-CP, NOR(EC-OP, TPEnable))
-    4 : """\
-  // Shared Point Type 4 -- OR inverted
-  // EO-CP={ecp}  EC-OP={eop}  CCreq={cc_req}  CCactual={cc_act}
-  wire _sp{i}_ctrl, _sp{i}_out;
-  nor _sp{i}_en  (_sp{i}_ctrl, {eop}, TPEnable);
-  or   _sp{i}_gate(_sp{i}_out,  {ecp}, _sp{i}_ctrl);
-  // replace downstream uses of {ecp} with _sp{i}_out
-""",
+    with open(filename, 'r') as f:
+        text = f.read()
+
+    # Remove line-continuation by joining continuation lines
+    # (DC wraps long lines; we join them for easier parsing)
+    text = re.sub(r'\\\n', ' ', text)
+
+    # Remove block comments
+    text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.DOTALL)
+    # Remove line comments
+    text = re.sub(r'//.*', '', text)
+
+    # ---- port declarations ----
+    input_re  = re.compile(r'\binput\b([^;]+);')
+    output_re = re.compile(r'\boutput\b([^;]+);')
+
+    ports_in  = set()
+    ports_out = set()
+
+    for m in input_re.finditer(text):
+        for net in re.split(r'[,\s]+', m.group(1)):
+            net = net.strip()
+            if net:
+                ports_in.add(net)
+
+    for m in output_re.finditer(text):
+        for net in re.split(r'[,\s]+', m.group(1)):
+            net = net.strip()
+            if net:
+                ports_out.add(net)
+
+    # ---- assign statements ----
+    assign_re = re.compile(r'\bassign\s+(\S+)\s*=\s*(\S+)\s*;')
+    assigns = []
+    for m in assign_re.finditer(text):
+        assigns.append((m.group(1), m.group(2)))
+
+    # ---- gate instances ----
+    # Pattern: CELLTYPE INSTNAME ( .PORT(NET), ... );
+    # Cell names in SAED32 end with _LVT
+    inst_re = re.compile(
+        r'(\w+_LVT)\s+(\\?[\w/\[\]]+)\s*\(([^;]+)\);',
+        re.DOTALL
+    )
+    port_re = re.compile(r'\.(\w+)\s*\(([^)]*)\)')
+
+    instances = []
+    for m in inst_re.finditer(text):
+        cell = m.group(1)
+        inst = m.group(2)
+        conn_str = m.group(3)
+        connections = {}
+        for pm in port_re.finditer(conn_str):
+            port = pm.group(1)
+            net  = pm.group(2).strip()
+            if net:
+                connections[port] = net
+        instances.append({'cell': cell, 'inst': inst, 'conn': connections})
+
+    return ports_in, ports_out, instances, assigns
+
+
+# ---------------------------------------------------------------------------
+# 3.  BUILD GRAPH  (net -> driving cell,  net -> fanout cells)
+# ---------------------------------------------------------------------------
+
+def get_cell_base(cell_name):
+    """Strip drive strength and _LVT suffix: NAND2X0_LVT -> NAND2"""
+    # Remove _LVT
+    name = re.sub(r'_LVT$', '', cell_name)
+    # Remove trailing drive strength (X0, X1, X2, ...)
+    name = re.sub(r'X\d+$', '', name)
+    return name
+
+
+# Map cell base name -> (input_ports, output_ports)
+# Output ports listed here are the SIGNAL outputs (not clock/scan).
+CELL_OUTPUT_PORTS = {
+    # Simple gates
+    'AND2':    (['A1','A2'],          ['Y']),
+    'AND3':    (['A1','A2','A3'],     ['Y']),
+    'AND4':    (['A1','A2','A3','A4'],['Y']),
+    'OR2':     (['A1','A2'],          ['Y']),
+    'OR3':     (['A1','A2','A3'],     ['Y']),
+    'OR4':     (['A1','A2','A3','A4'],['Y']),
+    'NAND2':   (['A1','A2'],          ['Y']),
+    'NAND3':   (['A1','A2','A3'],     ['Y']),
+    'NAND4':   (['A1','A2','A3','A4'],['Y']),
+    'NOR2':    (['A1','A2'],          ['Y']),
+    'NOR3':    (['A1','A2','A3'],     ['Y']),
+    'NOR4':    (['A1','A2','A3','A4'],['Y']),
+    'INV':     (['A'],                ['Y']),
+    'BUF':     (['A'],                ['Y']),
+    # AOI/OAI  (AND-OR-INV / OR-AND-INV)
+    # AOI21: Y = ~((A1&A2)|A3)   inputs: A1,A2,A3
+    'AOI21':   (['A1','A2','A3'],     ['Y']),
+    'AOI22':   (['A1','A2','A3','A4'],['Y']),
+    'OAI21':   (['A1','A2','A3'],     ['Y']),
+    'OAI22':   (['A1','A2','A3','A4'],['Y']),
+    'OAI221':  (['A1','A2','A3','A4','A5'], ['Y']),
+    # AO/OA (non-inverting)
+    'AO21':    (['A1','A2','A3'],     ['Y']),
+    'AO22':    (['A1','A2','A3','A4'],['Y']),
+    'AO221':   (['A1','A2','A3','A4','A5'],['Y']),
+    'AO222':   (['A1','A2','A3','A4','A5','A6'],['Y']),
+    'OA21':    (['A1','A2','A3'],     ['Y']),
+    'OA22':    (['A1','A2','A3','A4'],['Y']),
+    'OA221':   (['A1','A2','A3','A4','A5'],['Y']),
+    'OA222':   (['A1','A2','A3','A4','A5','A6'],['Y']),
+    # MUX
+    'MUX21':   (['A1','A2','S0'],     ['Y']),
+    'MUX41':   (['A1','A2','A3','A4','S0','S1'], ['Y']),
+    # Adders  — multiple outputs
+    'HADD':    (['A0','B0'],          ['SO','CO']),
+    'FADD':    (['A','B','CI'],       ['S','CO']),
+    # Flip-flops — Q is the combinational output for COP purposes
+    'SDFFX2':  (['D'],                ['Q','QN']),   # scan FF
+    'DFFX1':   (['D'],                ['Q','QN']),   # non-scan FF
 }
 
 
-def generate_verilog_patch(shared_points, conventional_cps,
-                            conventional_ops, output_path):
+def compute_cc1(base, input_cc1, conn):
     """
-    Emit a Verilog snippet containing all shared point gates.
-    Intended to be appended inside the top module of scan_netlist.v
-    before the endmodule keyword.
+    Compute 1-controllability of each output of a gate.
+    Returns dict {output_port: cc1_value}.
+    input_cc1: dict {port: cc1}
+    conn: dict {port: net}  (used only for MUX select logic)
     """
-    lines = [
-        "// ---------------------------------------------------------",
-        "// SPAR shared-point logic -- auto-generated",
-        "// Insert this block inside the top module,",
-        "// before endmodule.",
-        "// TPEnable: 1 = test mode, 0 = functional mode",
-        "// ---------------------------------------------------------",
-        "",
-        "input TPEnable;   // add to module port list",
-        "",
-    ]
+    def cc0(port):
+        return 1.0 - input_cc1.get(port, 0.5)
+    def cc1(port):
+        return input_cc1.get(port, 0.5)
 
-    for i, sp in enumerate(shared_points):
-        tmpl = SP_GATE_TEMPLATES[sp['sp_type']]
-        lines.append(tmpl.format(
-            i       = i,
-            ecp     = sp['eo_cp_net'],
-            eop     = sp['ec_op_net'],
-            cc_req  = sp['cc_req'],
-            cc_act  = sp['cc_actual'],
-        ))
+    result = {}
 
-    # Conventional CPs still need dedicated drivers
-    if conventional_cps:
-        lines.append("// -- Conventional CPs (no EC-OP pair found) --")
-        for net, cp_type in conventional_cps:
-            gate = 'or' if cp_type == 'OR' else 'and'
-            lines.append(
-                "  {0} _conv_cp_{1} (_conv_{1}_out, {1}, TPEnable);  "
-                "// {2}-type CP".format(gate, net, cp_type))
-        lines.append("")
+    if base in ('AND2','AND3','AND4'):
+        ins = [p for p in CELL_OUTPUT_PORTS[base][0]]
+        result['Y'] = clamp(prod(cc1(p) for p in ins))
 
-    out_dir = os.path.dirname(output_path)
-    if out_dir and not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-    with open(output_path, 'w') as f:
-        f.write('\n'.join(lines))
+    elif base in ('OR2','OR3','OR4'):
+        ins = CELL_OUTPUT_PORTS[base][0]
+        result['Y'] = clamp(1.0 - prod(cc0(p) for p in ins))
 
-    print("[+] Verilog patch -> {0}".format(output_path))
+    elif base in ('NAND2','NAND3','NAND4'):
+        ins = CELL_OUTPUT_PORTS[base][0]
+        result['Y'] = clamp(1.0 - prod(cc1(p) for p in ins))
+
+    elif base in ('NOR2','NOR3','NOR4'):
+        ins = CELL_OUTPUT_PORTS[base][0]
+        result['Y'] = clamp(prod(cc0(p) for p in ins))
+
+    elif base == 'INV':
+        result['Y'] = clamp(cc0('A'))
+
+    elif base == 'BUF':
+        result['Y'] = clamp(cc1('A'))
+
+    # AOI21: Y = ~((A1&A2)|A3)  => cc1(Y) = cc0((A1&A2)|A3)
+    elif base == 'AOI21':
+        and_part = cc1('A1') * cc1('A2')
+        or_cc1   = 1.0 - (1.0 - and_part) * cc0('A3')
+        result['Y'] = clamp(1.0 - or_cc1)
+
+    elif base == 'AOI22':
+        and1 = cc1('A1') * cc1('A2')
+        and2 = cc1('A3') * cc1('A4')
+        or_cc1 = 1.0 - (1.0 - and1) * (1.0 - and2)
+        result['Y'] = clamp(1.0 - or_cc1)
+
+    # OAI21: Y = ~((A1|A2)&A3)
+    elif base == 'OAI21':
+        or_part  = 1.0 - cc0('A1') * cc0('A2')
+        and_cc1  = or_part * cc1('A3')
+        result['Y'] = clamp(1.0 - and_cc1)
+
+    elif base == 'OAI22':
+        or1 = 1.0 - cc0('A1') * cc0('A2')
+        or2 = 1.0 - cc0('A3') * cc0('A4')
+        result['Y'] = clamp(1.0 - or1 * or2)
+
+    elif base == 'OAI221':
+        or1 = 1.0 - cc0('A1') * cc0('A2')
+        or2 = 1.0 - cc0('A3') * cc0('A4')
+        result['Y'] = clamp(1.0 - or1 * or2 * cc1('A5'))
+
+    # AO21: Y = (A1&A2)|A3
+    elif base == 'AO21':
+        and_part = cc1('A1') * cc1('A2')
+        result['Y'] = clamp(1.0 - (1.0 - and_part) * cc0('A3'))
+
+    elif base == 'AO22':
+        and1 = cc1('A1') * cc1('A2')
+        and2 = cc1('A3') * cc1('A4')
+        result['Y'] = clamp(1.0 - (1.0 - and1) * (1.0 - and2))
+
+    elif base == 'AO221':
+        and1 = cc1('A1') * cc1('A2')
+        and2 = cc1('A3') * cc1('A4')
+        result['Y'] = clamp(1.0 - (1.0 - and1) * (1.0 - and2) * cc0('A5'))
+
+    elif base == 'AO222':
+        and1 = cc1('A1') * cc1('A2')
+        and2 = cc1('A3') * cc1('A4')
+        and3 = cc1('A5') * cc1('A6')
+        result['Y'] = clamp(1.0 - (1.0-and1)*(1.0-and2)*(1.0-and3))
+
+    # OA21: Y = (A1|A2)&A3
+    elif base == 'OA21':
+        or_part = 1.0 - cc0('A1') * cc0('A2')
+        result['Y'] = clamp(or_part * cc1('A3'))
+
+    elif base == 'OA22':
+        or1 = 1.0 - cc0('A1') * cc0('A2')
+        or2 = 1.0 - cc0('A3') * cc0('A4')
+        result['Y'] = clamp(or1 * or2)
+
+    elif base == 'OA221':
+        or1 = 1.0 - cc0('A1') * cc0('A2')
+        or2 = 1.0 - cc0('A3') * cc0('A4')
+        result['Y'] = clamp(1.0 - (1.0 - or1*or2) * cc0('A5'))
+
+    elif base == 'OA222':
+        or1 = 1.0 - cc0('A1') * cc0('A2')
+        or2 = 1.0 - cc0('A3') * cc0('A4')
+        or3 = 1.0 - cc0('A5') * cc0('A6')
+        result['Y'] = clamp(or1 * or2 * or3)
+
+    # MUX21: Y = S0?A2:A1
+    elif base == 'MUX21':
+        result['Y'] = clamp(cc1('S0') * cc1('A2') + cc0('S0') * cc1('A1'))
+
+    # MUX41: Y = sel(S1,S0) -> one of A1..A4
+    elif base == 'MUX41':
+        # approximate: average of all data inputs weighted by select prob
+        result['Y'] = clamp(0.25*(cc1('A1')+cc1('A2')+cc1('A3')+cc1('A4')))
+
+    # HADD: SO = A0 XOR B0
+    elif base == 'HADD':
+        result['SO'] = clamp(cc1('A0')*cc0('B0') + cc0('A0')*cc1('B0'))
+        result['CO'] = clamp(cc1('A0') * cc1('B0'))
+
+    # FADD: S = A XOR B XOR CI
+    elif base == 'FADD':
+        # Approximate XOR chain
+        xor_ab = cc1('A')*cc0('B') + cc0('A')*cc1('B')
+        result['S']  = clamp(xor_ab*cc0('CI') + (1.0-xor_ab)*cc1('CI'))
+        result['CO'] = clamp(cc1('A')*cc1('B') +
+                             cc1('A')*cc1('CI') +
+                             cc1('B')*cc1('CI') -
+                             2.0*cc1('A')*cc1('B')*cc1('CI'))
+
+    # Flip-flops: treat Q as having cc1 = cc1(D) (steady-state approx)
+    elif base in ('SDFFX2', 'DFFX1'):
+        q_cc1 = cc1('D')
+        result['Q']  = clamp(q_cc1)
+        result['QN'] = clamp(1.0 - q_cc1)
+
+    else:
+        # Unknown cell: pass through 0.5
+        for op in CELL_OUTPUT_PORTS.get(base, ([], ['Y']))[1]:
+            result[op] = 0.5
+
+    return result
 
 
-# ===============================================================
-#  SECTION 11 - JSON REPORT
-# ===============================================================
+def compute_co_inputs(base, input_cc1, co_outputs):
+    """
+    Compute observability of each INPUT of a gate given:
+      input_cc1  : dict {input_port: cc1}
+      co_outputs : dict {output_port: co}   (already computed)
+    Returns dict {input_port: co_value}.
+    """
+    def cc0(port):
+        return 1.0 - input_cc1.get(port, 0.5)
+    def cc1(port):
+        return input_cc1.get(port, 0.5)
+    def co(oport):
+        return co_outputs.get(oport, 0.0)
 
-def write_json_report(shared_points, conventional_cps,
-                      conventional_ops, output_path):
-    out_dir = os.path.dirname(output_path)
-    if out_dir and not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-    report = {
-        'summary' : {
-            'shared_points'     : len(shared_points),
-            'conventional_cps'  : len(conventional_cps),
-            'conventional_ops'  : len(conventional_ops),
-        },
-        'shared_points'    : shared_points,
-        'conventional_cps' : [{'net': n, 'type': t}
-                               for n, t in conventional_cps],
-        'conventional_ops' : conventional_ops,
-    }
-    with open(output_path, 'w') as f:
-        json.dump(report, f, indent=2)
-    print("[+] JSON report    -> {0}".format(output_path))
+    result = {}
+
+    if base in ('AND2','AND3','AND4'):
+        ins = CELL_OUTPUT_PORTS[base][0]
+        co_y = co('Y')
+        for p in ins:
+            others = [q for q in ins if q != p]
+            result[p] = clamp(co_y * prod(cc1(q) for q in others))
+
+    elif base in ('OR2','OR3','OR4'):
+        ins = CELL_OUTPUT_PORTS[base][0]
+        co_y = co('Y')
+        for p in ins:
+            others = [q for q in ins if q != p]
+            result[p] = clamp(co_y * prod(cc0(q) for q in others))
+
+    elif base in ('NAND2','NAND3','NAND4'):
+        ins = CELL_OUTPUT_PORTS[base][0]
+        co_y = co('Y')
+        for p in ins:
+            others = [q for q in ins if q != p]
+            result[p] = clamp(co_y * prod(cc1(q) for q in others))
+
+    elif base in ('NOR2','NOR3','NOR4'):
+        ins = CELL_OUTPUT_PORTS[base][0]
+        co_y = co('Y')
+        for p in ins:
+            others = [q for q in ins if q != p]
+            result[p] = clamp(co_y * prod(cc0(q) for q in others))
+
+    elif base == 'INV':
+        result['A'] = clamp(co('Y'))
+
+    elif base == 'BUF':
+        result['A'] = clamp(co('Y'))
+
+    elif base == 'AOI21':
+        # Y = ~((A1&A2)|A3)
+        # Approximate: treat as NOR( AND(A1,A2), A3 )
+        and12 = cc1('A1') * cc1('A2')
+        co_y  = co('Y')
+        # Observability through AND-OR structure (approximation)
+        result['A1'] = clamp(co_y * cc1('A2') * cc0('A3'))
+        result['A2'] = clamp(co_y * cc1('A1') * cc0('A3'))
+        result['A3'] = clamp(co_y * (1.0 - and12))
+
+    elif base == 'AOI22':
+        and1 = cc1('A1') * cc1('A2')
+        and2 = cc1('A3') * cc1('A4')
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc1('A2') * (1.0 - and2))
+        result['A2'] = clamp(co_y * cc1('A1') * (1.0 - and2))
+        result['A3'] = clamp(co_y * cc1('A4') * (1.0 - and1))
+        result['A4'] = clamp(co_y * cc1('A3') * (1.0 - and1))
+
+    elif base == 'OAI21':
+        # Y = ~((A1|A2)&A3)
+        or12 = 1.0 - cc0('A1') * cc0('A2')
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc0('A2') * cc1('A3'))
+        result['A2'] = clamp(co_y * cc0('A1') * cc1('A3'))
+        result['A3'] = clamp(co_y * or12)
+
+    elif base == 'OAI22':
+        or1 = 1.0 - cc0('A1') * cc0('A2')
+        or2 = 1.0 - cc0('A3') * cc0('A4')
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc0('A2') * or2)
+        result['A2'] = clamp(co_y * cc0('A1') * or2)
+        result['A3'] = clamp(co_y * cc0('A4') * or1)
+        result['A4'] = clamp(co_y * cc0('A3') * or1)
+
+    elif base == 'OAI221':
+        or1 = 1.0 - cc0('A1') * cc0('A2')
+        or2 = 1.0 - cc0('A3') * cc0('A4')
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc0('A2') * or2 * cc1('A5'))
+        result['A2'] = clamp(co_y * cc0('A1') * or2 * cc1('A5'))
+        result['A3'] = clamp(co_y * cc0('A4') * or1 * cc1('A5'))
+        result['A4'] = clamp(co_y * cc0('A3') * or1 * cc1('A5'))
+        result['A5'] = clamp(co_y * or1 * or2)
+
+    elif base == 'AO21':
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc1('A2') * cc0('A3'))
+        result['A2'] = clamp(co_y * cc1('A1') * cc0('A3'))
+        result['A3'] = clamp(co_y * (1.0 - cc1('A1')*cc1('A2')))
+
+    elif base == 'AO22':
+        and1 = cc1('A1') * cc1('A2')
+        and2 = cc1('A3') * cc1('A4')
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc1('A2') * (1.0-and2))
+        result['A2'] = clamp(co_y * cc1('A1') * (1.0-and2))
+        result['A3'] = clamp(co_y * cc1('A4') * (1.0-and1))
+        result['A4'] = clamp(co_y * cc1('A3') * (1.0-and1))
+
+    elif base == 'AO221':
+        and1 = cc1('A1') * cc1('A2')
+        and2 = cc1('A3') * cc1('A4')
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc1('A2') * (1.0-and2) * cc0('A5'))
+        result['A2'] = clamp(co_y * cc1('A1') * (1.0-and2) * cc0('A5'))
+        result['A3'] = clamp(co_y * cc1('A4') * (1.0-and1) * cc0('A5'))
+        result['A4'] = clamp(co_y * cc1('A3') * (1.0-and1) * cc0('A5'))
+        result['A5'] = clamp(co_y * (1.0 - (1.0-and1)*(1.0-and2)))
+
+    elif base == 'AO222':
+        and1 = cc1('A1') * cc1('A2')
+        and2 = cc1('A3') * cc1('A4')
+        and3 = cc1('A5') * cc1('A6')
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc1('A2') * (1.0-and2) * (1.0-and3))
+        result['A2'] = clamp(co_y * cc1('A1') * (1.0-and2) * (1.0-and3))
+        result['A3'] = clamp(co_y * cc1('A4') * (1.0-and1) * (1.0-and3))
+        result['A4'] = clamp(co_y * cc1('A3') * (1.0-and1) * (1.0-and3))
+        result['A5'] = clamp(co_y * cc1('A6') * (1.0-and1) * (1.0-and2))
+        result['A6'] = clamp(co_y * cc1('A5') * (1.0-and1) * (1.0-and2))
+
+    elif base == 'OA21':
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc0('A2') * cc1('A3'))
+        result['A2'] = clamp(co_y * cc0('A1') * cc1('A3'))
+        result['A3'] = clamp(co_y * (1.0 - cc0('A1')*cc0('A2')))
+
+    elif base == 'OA22':
+        or1 = 1.0 - cc0('A1') * cc0('A2')
+        or2 = 1.0 - cc0('A3') * cc0('A4')
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc0('A2') * or2)
+        result['A2'] = clamp(co_y * cc0('A1') * or2)
+        result['A3'] = clamp(co_y * cc0('A4') * or1)
+        result['A4'] = clamp(co_y * cc0('A3') * or1)
+
+    elif base == 'OA221':
+        or1 = 1.0 - cc0('A1') * cc0('A2')
+        or2 = 1.0 - cc0('A3') * cc0('A4')
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc0('A2') * or2 * cc1('A5'))
+        result['A2'] = clamp(co_y * cc0('A1') * or2 * cc1('A5'))
+        result['A3'] = clamp(co_y * cc0('A4') * or1 * cc1('A5'))
+        result['A4'] = clamp(co_y * cc0('A3') * or1 * cc1('A5'))
+        result['A5'] = clamp(co_y * or1 * or2)
+
+    elif base == 'OA222':
+        or1 = 1.0 - cc0('A1') * cc0('A2')
+        or2 = 1.0 - cc0('A3') * cc0('A4')
+        or3 = 1.0 - cc0('A5') * cc0('A6')
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc0('A2') * or2 * or3)
+        result['A2'] = clamp(co_y * cc0('A1') * or2 * or3)
+        result['A3'] = clamp(co_y * cc0('A4') * or1 * or3)
+        result['A4'] = clamp(co_y * cc0('A3') * or1 * or3)
+        result['A5'] = clamp(co_y * cc0('A6') * or1 * or2)
+        result['A6'] = clamp(co_y * cc0('A5') * or1 * or2)
+
+    elif base == 'MUX21':
+        co_y = co('Y')
+        result['A1'] = clamp(co_y * cc0('S0'))
+        result['A2'] = clamp(co_y * cc1('S0'))
+        result['S0'] = clamp(co_y * abs(cc1('A1') - cc1('A2')))
+
+    elif base == 'MUX41':
+        co_y = co('Y')
+        for p in ['A1','A2','A3','A4']:
+            result[p] = clamp(co_y * 0.25)
+        result['S0'] = clamp(co_y * 0.5)
+        result['S1'] = clamp(co_y * 0.5)
+
+    elif base == 'HADD':
+        # SO = A0 XOR B0,  CO = A0 AND B0
+        co_so = co('SO')
+        co_co = co('CO')
+        result['A0'] = clamp(co_so * cc0('B0') + co_so * cc1('B0') + co_co * cc1('B0'))
+        result['B0'] = clamp(co_so * cc0('A0') + co_so * cc1('A0') + co_co * cc1('A0'))
+
+    elif base == 'FADD':
+        co_s  = co('S')
+        co_co = co('CO')
+        # Approximate
+        result['A']  = clamp(co_s * 1.0 + co_co * (cc1('B') + cc1('CI') - cc1('B')*cc1('CI')))
+        result['B']  = clamp(co_s * 1.0 + co_co * (cc1('A') + cc1('CI') - cc1('A')*cc1('CI')))
+        result['CI'] = clamp(co_s * 1.0 + co_co * (cc1('A') + cc1('B')  - cc1('A')*cc1('B')))
+        # Clamp again
+        for k in result:
+            result[k] = clamp(result[k])
+
+    elif base in ('SDFFX2', 'DFFX1'):
+        # D input observability = co(Q)
+        co_q  = co('Q')
+        co_qn = co('QN')
+        result['D'] = clamp(co_q + co_qn)
+
+    else:
+        for ip in CELL_OUTPUT_PORTS.get(base, (['A'], ['Y']))[0]:
+            result[ip] = 0.0
+
+    return result
 
 
-# ===============================================================
-#  ENTRY POINT
-# ===============================================================
+# ---------------------------------------------------------------------------
+# 4.  TOPOLOGICAL SORT  (Kahn's algorithm on the net/gate graph)
+# ---------------------------------------------------------------------------
+
+def build_and_sort(ports_in, ports_out, instances, assigns):
+    """
+    Build a net-level graph and return instances in topological order
+    (PI-to-PO direction).
+
+    net_driver[net]  -> instance index that drives it (or None for PI)
+    net_fanout[net]  -> list of instance indices that read it
+    """
+    n = len(instances)
+
+    # Map net -> driving instance index
+    net_driver = {}   # net -> inst_idx  (None = PI)
+    net_fanout = defaultdict(list)  # net -> [inst_idx, ...]
+
+    # PIs drive themselves
+    for pi in ports_in:
+        net_driver[pi] = None  # driven by PI
+
+    # Assigns: lhs driven by rhs (treat as a wire alias)
+    assign_map = {}  # lhs -> rhs
+    for lhs, rhs in assigns:
+        assign_map[lhs] = rhs
+
+    def resolve(net):
+        """Follow assign chain to find ultimate driver."""
+        visited = set()
+        while net in assign_map and net not in visited:
+            visited.add(net)
+            net = assign_map[net]
+        return net
+
+    # For each instance, determine which nets it drives (outputs)
+    # and which nets it reads (inputs)
+    inst_outputs = []   # inst_idx -> list of driven nets
+    inst_inputs  = []   # inst_idx -> list of read nets
+
+    for idx, inst in enumerate(instances):
+        cell  = inst['cell']
+        conn  = inst['conn']
+        base  = get_cell_base(cell)
+        info  = CELL_OUTPUT_PORTS.get(base)
+
+        if info is None:
+            inst_outputs.append([])
+            inst_inputs.append([])
+            continue
+
+        in_ports, out_ports = info
+
+        outs = []
+        for op in out_ports:
+            net = conn.get(op)
+            if net:
+                net_driver[net] = idx
+                outs.append(net)
+        inst_outputs.append(outs)
+
+        ins = []
+        for ip in in_ports:
+            net = conn.get(ip)
+            if net:
+                rnet = resolve(net)
+                net_fanout[rnet].append(idx)
+                ins.append(rnet)
+        inst_inputs.append(ins)
+
+    # Kahn topological sort
+    # in-degree of each instance = number of its input nets whose
+    # driver has not yet been processed
+    in_degree = [0] * n
+    for idx in range(n):
+        for net in inst_inputs[idx]:
+            drv = net_driver.get(net)
+            if drv is not None:  # driven by another gate
+                in_degree[idx] += 1
+
+    # A gate is ready when all its input nets are resolved
+    # Reframe: build gate->gate dependency
+    gate_deps = [set() for _ in range(n)]   # gate_deps[i] = set of gates i depends on
+    for idx in range(n):
+        for net in inst_inputs[idx]:
+            drv = net_driver.get(net)
+            if drv is not None:
+                gate_deps[idx].add(drv)
+
+    in_deg = [len(gate_deps[i]) for i in range(n)]
+    gate_fanout = defaultdict(list)  # gate -> gates that depend on it
+    for idx in range(n):
+        for dep in gate_deps[idx]:
+            gate_fanout[dep].append(idx)
+
+    queue = deque(i for i in range(n) if in_deg[i] == 0)
+    topo  = []
+    while queue:
+        i = queue.popleft()
+        topo.append(i)
+        for j in gate_fanout[i]:
+            in_deg[j] -= 1
+            if in_deg[j] == 0:
+                queue.append(j)
+
+    return topo, net_driver, net_fanout, inst_inputs, inst_outputs, assign_map
+
+
+# ---------------------------------------------------------------------------
+# 5.  COP MAIN PASS
+# ---------------------------------------------------------------------------
+
+def run_cop(ports_in, ports_out, instances, assigns):
+    """
+    Run the COP algorithm.
+    Returns:
+        cc1[net]  : 1-controllability  (float in [0,1])
+        co[net]   : observability      (float in [0,1])
+    """
+    topo, net_driver, net_fanout, inst_inputs, inst_outputs, assign_map = \
+        build_and_sort(ports_in, ports_out, instances, assigns)
+
+    # --- FORWARD PASS: compute cc1 for every net ---
+    cc1 = {}
+
+    # Initialize PIs to 0.5
+    for pi in ports_in:
+        cc1[pi] = 0.5
+
+    # Process gates in topological order
+    for idx in topo:
+        inst  = instances[idx]
+        cell  = inst['cell']
+        conn  = inst['conn']
+        base  = get_cell_base(cell)
+        info  = CELL_OUTPUT_PORTS.get(base)
+        if info is None:
+            continue
+
+        in_ports, out_ports = info
+
+        # Gather input cc1 values (resolve assigns)
+        input_cc1 = {}
+        for ip in in_ports:
+            net = conn.get(ip)
+            if net:
+                rnet = net
+                visited = set()
+                while rnet in assign_map and rnet not in visited:
+                    visited.add(rnet)
+                    rnet = assign_map[rnet]
+                input_cc1[ip] = cc1.get(rnet, 0.5)
+
+        out_cc1 = compute_cc1(base, input_cc1, conn)
+
+        for op, val in out_cc1.items():
+            net = conn.get(op)
+            if net:
+                cc1[net] = val
+
+    # Propagate cc1 through assigns
+    for lhs, rhs in assigns:
+        if rhs in cc1 and lhs not in cc1:
+            cc1[lhs] = cc1[rhs]
+
+    # --- BACKWARD PASS: compute observability for every net ---
+    co = {}
+
+    # POs have observability = 1.0
+    for po in ports_out:
+        co[po] = 1.0
+
+    # Scan FF outputs (Q, QN) are observable through scan chain
+    for inst in instances:
+        base = get_cell_base(inst['cell'])
+        if base in ('SDFFX2', 'DFFX1'):
+            for op in ['Q', 'QN']:
+                net = inst['conn'].get(op)
+                if net:
+                    co[net] = max(co.get(net, 0.0), 1.0)
+
+    # Process gates in REVERSE topological order
+    for idx in reversed(topo):
+        inst  = instances[idx]
+        cell  = inst['cell']
+        conn  = inst['conn']
+        base  = get_cell_base(cell)
+        info  = CELL_OUTPUT_PORTS.get(base)
+        if info is None:
+            continue
+
+        in_ports, out_ports = info
+
+        # Gather input cc1 values (needed for co computation)
+        input_cc1 = {}
+        for ip in in_ports:
+            net = conn.get(ip)
+            if net:
+                rnet = net
+                visited = set()
+                while rnet in assign_map and rnet not in visited:
+                    visited.add(rnet)
+                    rnet = assign_map[rnet]
+                input_cc1[ip] = cc1.get(rnet, 0.5)
+
+        # Gather output co values
+        co_outputs = {}
+        for op in out_ports:
+            net = conn.get(op)
+            if net:
+                co_outputs[op] = co.get(net, 0.0)
+
+        # Compute input observabilities
+        co_inputs = compute_co_inputs(base, input_cc1, co_outputs)
+
+        # Accumulate: a net may be read by multiple gates
+        for ip, val in co_inputs.items():
+            net = conn.get(ip)
+            if net:
+                rnet = net
+                visited = set()
+                while rnet in assign_map and rnet not in visited:
+                    visited.add(rnet)
+                    rnet = assign_map[rnet]
+                # Observability of a net with multiple fanouts:
+                # co(net) = 1 - prod(1 - co_i) for each fanout path
+                # Approximate: use max (common simplification)
+                co[rnet] = clamp(max(co.get(rnet, 0.0), val))
+
+    # Propagate co through assigns (backward)
+    for lhs, rhs in reversed(assigns):
+        if lhs in co and rhs not in co:
+            co[rhs] = co[lhs]
+
+    return cc1, co
+
+
+# ---------------------------------------------------------------------------
+# 6.  TP FILE PARSER & CANDIDATE IDENTIFICATION
+# ---------------------------------------------------------------------------
+
+def parse_tp_file(tp_file):
+    """
+    Parse TetraMAX tp_analysis.txt.
+    Returns:
+        cps: list of (net, type)  type in {'control_0','control_1'}
+        ops: list of net
+    """
+    cps = []
+    ops = []
+    with open(tp_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            # continuation lines end with backslash in original but we
+            # deal with them by joining in a pre-pass
+            m = re.match(r'set_test_point_element\s*\{([^}]+)\}\s*-type\s+(\S+)', line)
+            if m:
+                nets_raw = m.group(1).split()
+                tp_type  = m.group(2)
+                nets = [n.strip('\\') for n in nets_raw if n.strip('\\')]
+                if tp_type in ('control_0', 'control_1'):
+                    for net in nets:
+                        cps.append((net, tp_type))
+                elif tp_type == 'observe':
+                    for net in nets:
+                        ops.append(net)
+    return cps, ops
+
+
+def identify_candidates(cps, ops, cc1, co, verbose=True):
+    """
+    Apply SPAR Section IV thresholds to classify EO-CPs and EC-OPs.
+
+    CCTh = max( avg(CC of OR-CPs), avg(1 - CC of AND-CPs) )
+    COTh = avg(CO of OPs)
+    """
+    # Compute average CC of CP types
+    or_cps  = [net for net, t in cps if t == 'control_1']
+    and_cps = [net for net, t in cps if t == 'control_0']
+
+    def net_cc1(net):
+        # Try direct, then with /Y suffix stripped
+        return cc1.get(net, cc1.get(net.rstrip('/Y'), 0.5))
+
+    def net_co(net):
+        return co.get(net, co.get(net.rstrip('/Y'), 0.0))
+
+    avg_cc_or  = (sum(net_cc1(n) for n in or_cps)  / len(or_cps))  if or_cps  else 0.0
+    avg_1mcc_and = (sum(1.0 - net_cc1(n) for n in and_cps) / len(and_cps)) if and_cps else 0.0
+    CC_Th = max(avg_cc_or, avg_1mcc_and)
+
+    avg_co_op = (sum(net_co(n) for n in ops) / len(ops)) if ops else 0.0
+    CO_Th = avg_co_op
+
+    if verbose:
+        print("\n--- COP-based Thresholds ---")
+        print("  CCTh = max(avg CC of OR-CPs={:.4f}, avg (1-CC) of AND-CPs={:.4f}) = {:.4f}".format(
+            avg_cc_or, avg_1mcc_and, CC_Th))
+        print("  COTh = avg CO of OPs = {:.4f}".format(CO_Th))
+
+    # Identify EO-CPs: CP lines with CO > COTh
+    eo_cps = []
+    for net, tp_type in cps:
+        obs = net_co(net)
+        if obs > CO_Th:
+            eo_cps.append((net, tp_type, obs))
+
+    # Identify EC-OPs: OP lines where CCTh < CC < 1-CCTh
+    ec_ops = []
+    for net in ops:
+        ctrl = net_cc1(net)
+        if CC_Th < ctrl < (1.0 - CC_Th):
+            ec_ops.append((net, ctrl))
+
+    return eo_cps, ec_ops, CC_Th, CO_Th
+
+
+# ---------------------------------------------------------------------------
+# 7.  MAIN
+# ---------------------------------------------------------------------------
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='COP testability analysis for SPAR')
+    parser.add_argument('netlist', help='Gate-level Verilog netlist')
+    parser.add_argument('--tp_file', help='TetraMAX tp_analysis.txt', default=None)
+    args = parser.parse_args()
+
+    print("Parsing netlist: {}".format(args.netlist))
+    ports_in, ports_out, instances, assigns = parse_verilog(args.netlist)
+    print("  PIs={}, POs={}, instances={}, assigns={}".format(
+        len(ports_in), len(ports_out), len(instances), len(assigns)))
+
+    print("Running COP...")
+    cc1_vals, co_vals = run_cop(ports_in, ports_out, instances, assigns)
+    print("  CC1 computed for {} nets".format(len(cc1_vals)))
+    print("  CO  computed for {} nets".format(len(co_vals)))
+
+    # Print some sample values
+    print("\n--- Sample PI controllabilities (should all be ~0.5) ---")
+    for pi in sorted(list(ports_in))[:5]:
+        print("  PI {:20s}  CC1={:.4f}  CO={:.4f}".format(
+            pi, cc1_vals.get(pi, -1), co_vals.get(pi, -1)))
+
+    print("\n--- Sample PO observabilities (should all be 1.0) ---")
+    for po in sorted(list(ports_out))[:5]:
+        print("  PO {:20s}  CC1={:.4f}  CO={:.4f}".format(
+            po, cc1_vals.get(po, -1), co_vals.get(po, -1)))
+
+    if args.tp_file:
+        print("\nParsing TP file: {}".format(args.tp_file))
+        cps, ops = parse_tp_file(args.tp_file)
+        print("  CPs={}, OPs={}".format(len(cps), len(ops)))
+
+        print("\n--- CC1 and CO for all CPs ---")
+        for net, tp_type in cps:
+            ctrl = cc1_vals.get(net, -1)
+            obs  = co_vals.get(net, -1)
+            cp_label = 'OR-CP' if tp_type == 'control_1' else 'AND-CP'
+            print("  {:8s}  {:30s}  CC1={:.4f}  CO={:.6f}".format(
+                cp_label, net, ctrl, obs))
+
+        print("\n--- CC1 and CO for all OPs ---")
+        for net in ops:
+            ctrl = cc1_vals.get(net, -1)
+            obs  = co_vals.get(net, -1)
+            print("  OP  {:30s}  CC1={:.4f}  CO={:.6f}".format(net, ctrl, obs))
+
+        eo_cps, ec_ops, CC_Th, CO_Th = identify_candidates(
+            cps, ops, cc1_vals, co_vals)
+
+        print("\n--- EO-CP candidates (CO > COTh={:.4f}) ---".format(CO_Th))
+        for net, tp_type, obs in eo_cps:
+            cp_label = 'OR-CP' if tp_type == 'control_1' else 'AND-CP'
+            print("  {:8s}  {:30s}  CO={:.6f}".format(cp_label, net, obs))
+
+        print("\n--- EC-OP candidates (CCTh={:.4f} < CC1 < {:.4f}) ---".format(
+            CC_Th, 1.0-CC_Th))
+        for net, ctrl in ec_ops:
+            print("  OP  {:30s}  CC1={:.4f}".format(net, ctrl))
+
+        print("\nSummary: EO-CPs={}, EC-OPs={}".format(len(eo_cps), len(ec_ops)))
+
 
 if __name__ == '__main__':
-    netlist_path = (sys.argv[1]
-                    if len(sys.argv) > 1
-                    else "netlist/scan_netlist_flat.v")
-    DTh          = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
-    cp_bud       = float(sys.argv[3]) if len(sys.argv) > 3 else 0.05
-    op_bud       = float(sys.argv[4]) if len(sys.argv) > 4 else 0.05
-
-    sps, conv_cps, conv_ops, nl = run_spar(
-        netlist_path, DTh, cp_bud, op_bud)
-
-    write_json_report(sps, conv_cps, conv_ops,
-                      "reports/shared_points.json")
-    generate_verilog_patch(sps, conv_cps, conv_ops,
-                           "reports/spar_patch.v")
-    print("\nDone. Next step: 04_resynth.tcl")
+    main()

@@ -894,6 +894,10 @@ def main():
         cps, ops = parse_tp_file(args.tp_file)
         print("  CPs={}, OPs={}".format(len(cps), len(ops)))
 
+        for net, tp_type in cps:
+            if net not in cc1_vals:
+                print("NOT FOUND:", net)
+
         print("\n--- CC1 and CO for all CPs ---")
         for net, tp_type in cps:
             ctrl = cc1_vals.get(net, -1)

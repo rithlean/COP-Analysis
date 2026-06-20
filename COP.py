@@ -62,7 +62,7 @@ CELL_OUTPUT_PORTS = {
     'MUX41':  (['A1','A2','A3','A4','S0','S1'],    ['Y']),
     'HADD':   (['A0','B0'],                        ['SO','CO']),
     'FADD':   (['A','B','CI'],                     ['S','CO']),
-    # Flip-flops — only D is the combinational input for COP purposes
+    # Flip-flops - only D is the combinational input for COP purposes
     'SDFFX2': (['D'],                              ['Q','QN']),
     'DFFX1':  (['D'],                              ['Q','QN']),
 }
@@ -221,7 +221,7 @@ def make_lookup(pin_to_net, cc1_vals):
 
 
 # ---------------------------------------------------------------------------
-# COP FORWARD PASS — compute CC1 for every net
+# COP FORWARD PASS - compute CC1 for every net
 # ---------------------------------------------------------------------------
 
 def compute_cc1(base, input_cc1):
@@ -362,7 +362,7 @@ def compute_cc1(base, input_cc1):
 
 
 # ---------------------------------------------------------------------------
-# COP BACKWARD PASS — compute CO for each input given output CO values
+# COP BACKWARD PASS - compute CO for each input given output CO values
 # ---------------------------------------------------------------------------
 
 def compute_co_inputs(base, input_cc1, co_outputs):
@@ -725,38 +725,63 @@ def run_cop(ports_in, ports_out, instances, assigns):
                 if net:
                     co[net] = max(co.get(net, 0.0), 1.0)
 
-    for idx in reversed(topo):
-        inst = instances[idx]
-        base = get_cell_base(inst['cell'])
-        info = CELL_OUTPUT_PORTS.get(base)
-        if info is None:
-            continue
-        in_ports, out_ports = info
-        conn = inst['conn']
+    # Propagate CO backward through assign aliases before gate sweep
+    # so internal nets driven by POs start with CO=1
+    for lhs, rhs in assigns:
+        if lhs in co:
+            co[rhs] = max(co.get(rhs, 0.0), co[lhs])
 
-        input_cc1 = {}
-        for ip in in_ports:
-            net = conn.get(ip)
-            if net:
-                input_cc1[ip] = cc1.get(resolve(net), 0.5)
+    # Iterative backward sweep until convergence.
+    # A single reversed-topo pass is insufficient when CO values flow
+    # through sequential feedback paths (FF Q -> combinational -> FF D)
+    # because the FF D input observability depends on CO already set at
+    # the FF Q output, which may not yet be visible when the feeding gate
+    # is first processed. Two to three iterations always suffice in practice.
+    MAX_ITER = 10
+    for _ in range(MAX_ITER):
+        changed = False
+        for idx in reversed(topo):
+            inst = instances[idx]
+            base = get_cell_base(inst['cell'])
+            info = CELL_OUTPUT_PORTS.get(base)
+            if info is None:
+                continue
+            in_ports, out_ports = info
+            conn = inst['conn']
 
-        co_outputs = {}
-        for op in out_ports:
-            net = conn.get(op)
-            if net:
-                co_outputs[op] = co.get(net, 0.0)
+            input_cc1 = {}
+            for ip in in_ports:
+                net = conn.get(ip)
+                if net:
+                    input_cc1[ip] = cc1.get(resolve(net), 0.5)
 
-        for ip, val in compute_co_inputs(base, input_cc1, co_outputs).items():
-            net = conn.get(ip)
-            if net:
-                rnet = resolve(net)
-                # Multi-fanout rule: co = max over all fanout paths (approximation)
-                co[rnet] = clamp(max(co.get(rnet, 0.0), val))
+            co_outputs = {}
+            for op in out_ports:
+                net = conn.get(op)
+                if net:
+                    co_outputs[op] = co.get(net, 0.0)
 
-    # Propagate backwards through assigns
-    for lhs, rhs in reversed(assigns):
-        if lhs in co and rhs not in co:
-            co[rhs] = co[lhs]
+            for ip, val in compute_co_inputs(base, input_cc1, co_outputs).items():
+                net = conn.get(ip)
+                if net:
+                    rnet = resolve(net)
+                    old = co.get(rnet, 0.0)
+                    new = clamp(max(old, val))
+                    if new > old + 1e-9:
+                        co[rnet] = new
+                        changed = True
+
+        # Propagate backwards through assigns each iteration
+        for lhs, rhs in reversed(assigns):
+            if lhs in co:
+                old = co.get(rhs, 0.0)
+                new = max(old, co[lhs])
+                if new > old + 1e-9:
+                    co[rhs] = new
+                    changed = True
+
+        if not changed:
+            break
 
     return cc1, co
 

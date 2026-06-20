@@ -178,6 +178,7 @@ CELL_OUTPUT_PORTS = {
     'SDFFX2':  (['D'],                ['Q','QN']),   # scan FF
     'DFFX1':   (['D'],                ['Q','QN']),   # non-scan FF
 }
+unknown_cells = set()
 
 
 def compute_cc1(base, input_cc1, conn):
@@ -585,8 +586,7 @@ def build_and_sort(ports_in, ports_out, instances, assigns):
         info  = CELL_OUTPUT_PORTS.get(base)
 
         if info is None:
-            inst_outputs.append([])
-            inst_inputs.append([])
+            unknown_cells.add(base)
             continue
 
         in_ports, out_ports = info
@@ -886,6 +886,9 @@ def main():
     cc1_vals, co_vals = run_cop(ports_in, ports_out, instances, assigns)
     print("  CC1 computed for {} nets".format(len(cc1_vals)))
     print("  CO  computed for {} nets".format(len(co_vals)))
+    print("\nUnknown cell types:")
+    for c in sorted(unknown_cells):
+        print(" ", c)
 
     # Print some sample values
     print("\n--- Sample PI controllabilities (should all be ~0.5) ---")

@@ -914,9 +914,9 @@ def main():
         for net, tp_type in cps:
 
             real_net = pin_to_net.get(net, net)
-                print("{} -> {}".format(net, real_net))
-                ctrl = cc1_vals.get(real_net, -1)
-                obs  = co_vals.get(real_net, -1)
+            print("{} -> {}".format(net, real_net))
+            ctrl = cc1_vals.get(real_net, -1)
+            obs  = co_vals.get(real_net, -1)
             
             cp_label = 'OR-CP' if tp_type == 'control_1' else 'AND-CP'
             print("  {:8s}  {:30s}  CC1={:.4f}  CO={:.6f}".format(

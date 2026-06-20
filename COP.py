@@ -171,10 +171,10 @@ CELL_OUTPUT_PORTS = {
     # MUX
     'MUX21':   (['A1','A2','S0'],     ['Y']),
     'MUX41':   (['A1','A2','A3','A4','S0','S1'], ['Y']),
-    # Adders  — multiple outputs
+    # Adders  - multiple outputs
     'HADD':    (['A0','B0'],          ['SO','CO']),
     'FADD':    (['A','B','CI'],       ['S','CO']),
-    # Flip-flops — Q is the combinational output for COP purposes
+    # Flip-flops - Q is the combinational output for COP purposes
     'SDFFX2':  (['D'],                ['Q','QN']),   # scan FF
     'DFFX1':   (['D'],                ['Q','QN']),   # non-scan FF
 }
@@ -870,6 +870,15 @@ def main():
 
     print("Parsing netlist: {}".format(args.netlist))
     ports_in, ports_out, instances, assigns = parse_verilog(args.netlist)
+    # Build instance/pin -> net lookup
+    pin_to_net = {}
+
+    for inst in instances:
+        inst_name = inst['inst']
+
+        for port, net in inst['conn'].items():
+            pin_to_net["{}/{}".format(inst_name, port)] = net
+    
     print("  PIs={}, POs={}, instances={}, assigns={}".format(
         len(ports_in), len(ports_out), len(instances), len(assigns)))
 
@@ -900,16 +909,22 @@ def main():
 
         print("\n--- CC1 and CO for all CPs ---")
         for net, tp_type in cps:
-            ctrl = cc1_vals.get(net, -1)
-            obs  = co_vals.get(net, -1)
+
+            real_net = pin_to_net.get(net, net)
+                print("{} -> {}".format(net, real_net))
+                ctrl = cc1_vals.get(real_net, -1)
+                obs  = co_vals.get(real_net, -1)
+            
             cp_label = 'OR-CP' if tp_type == 'control_1' else 'AND-CP'
             print("  {:8s}  {:30s}  CC1={:.4f}  CO={:.6f}".format(
                 cp_label, net, ctrl, obs))
 
         print("\n--- CC1 and CO for all OPs ---")
         for net in ops:
-            ctrl = cc1_vals.get(net, -1)
-            obs  = co_vals.get(net, -1)
+            real_net = pin_to_net.get(net, net)
+
+            ctrl = cc1_vals.get(real_net, -1)
+            obs  = co_vals.get(real_net, -1)
             print("  OP  {:30s}  CC1={:.4f}  CO={:.6f}".format(net, ctrl, obs))
 
         eo_cps, ec_ops, CC_Th, CO_Th = identify_candidates(

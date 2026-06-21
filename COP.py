@@ -860,35 +860,121 @@ def run_cop(ports_in, ports_out, instances, assigns):
 # CANDIDATE IDENTIFICATION  (SPAR Section IV)
 # ---------------------------------------------------------------------------
 
-def identify_candidates(cps, ops, cc1_vals, co_vals, pin_to_net, verbose=True):
+def resolve_cp_net(ref, cp_type, pin_to_net, cc1_vals, instances):
     """
-    Classify test points as EO-CP or EC-OP using CCTh and COTh.
+    Resolve a TetraMAX CP pin-reference to the actual net being controlled.
 
-    EO-CP : CP whose output net has CO > COTh  (easily observable CP)
-    EC-OP : OP whose output net has CCTh < CC1 < 1-CCTh  (easily controllable OP)
+    TetraMAX names CPs as 'INST/Y' where INST is the gate whose INPUT
+    is being controlled, not necessarily the gate whose output is flagged.
+    When the output CC1 of INST is inconsistent with the CP type
+    (e.g. high CC1 for an OR-CP that should have low CC1), the actual
+    controlled net is the input of INST that has the type-consistent CC1.
 
-    CCTh = max( avg CC1 of OR-CPs,  avg(1 - CC1) of AND-CPs )
-    COTh = avg CO of OPs
+    For OR-type (control_1): controlled net should have LOW CC1
+    For AND-type (control_0): controlled net should have HIGH CC1
     """
     lookup = make_lookup(pin_to_net, cc1_vals)
 
-    def get_cc1(ref):
-        net = lookup(ref)
-        return cc1_vals[net] if (net and net in cc1_vals) else None
+    # First try: resolve as an output net directly
+    out_net = lookup(ref)
+    out_cc1 = cc1_vals.get(out_net, None) if out_net else None
+
+    # Check consistency with CP type
+    if out_cc1 is not None:
+        if cp_type == 'control_1' and out_cc1 < 0.3:
+            return out_net, out_cc1   # output is the correct low-CC1 net
+        if cp_type == 'control_0' and out_cc1 > 0.7:
+            return out_net, out_cc1   # output is the correct high-CC1 net
+
+    # Output is inconsistent with CP type — find the type-consistent input
+    # Extract gate name from ref (e.g. 'U478/Y' -> 'U478', '\DFF_x/Q_reg/QN' -> skip)
+    parts = ref.lstrip('\\').split('/')
+    gate_name = '\\' + parts[0] if ref.startswith('\\') else parts[0]
+
+    # Find the instance
+    target_inst = None
+    for inst in instances:
+        if inst['inst'] == gate_name or inst['inst'] == '\\' + gate_name:
+            target_inst = inst
+            break
+    if target_inst is None:
+        # Return output net as fallback even if inconsistent
+        return out_net, out_cc1
+
+    base = get_cell_base(target_inst['cell'])
+    info = CELL_OUTPUT_PORTS.get(base)
+    if info is None:
+        return out_net, out_cc1
+
+    in_ports = info[0]
+    conn = target_inst['conn']
+
+    if cp_type == 'control_1':
+        # OR-type: find input with lowest CC1
+        best_net, best_cc1 = out_net, out_cc1 if out_cc1 is not None else 1.0
+        for ip in in_ports:
+            net = conn.get(ip)
+            if net:
+                c = cc1_vals.get(net, 0.5)
+                if c < (best_cc1 if best_cc1 is not None else 1.0):
+                    best_cc1 = c
+                    best_net = net
+        return best_net, best_cc1
+    else:
+        # AND-type: find input with highest CC1
+        best_net, best_cc1 = out_net, out_cc1 if out_cc1 is not None else 0.0
+        for ip in in_ports:
+            net = conn.get(ip)
+            if net:
+                c = cc1_vals.get(net, 0.5)
+                if c > (best_cc1 if best_cc1 is not None else 0.0):
+                    best_cc1 = c
+                    best_net = net
+        return best_net, best_cc1
+
+
+def identify_candidates(cps, ops, cc1_vals, co_vals, pin_to_net,
+                        instances, verbose=True):
+    """
+    Classify test points as EO-CP or EC-OP using CCTh and COTh.
+
+    EO-CP : CP whose controlled net has CO > COTh  (easily observable CP)
+    EC-OP : OP whose net has CCTh < CC1 < 1-CCTh  (easily controllable OP)
+
+    CCTh = max( avg CC1 of OR-CPs,  avg(1 - CC1) of AND-CPs )
+    COTh = avg CO of OPs
+
+    CP nets are resolved using type-consistent input search when the
+    output net CC1 is inconsistent with the CP type (Section IV, SPAR).
+    """
+    lookup = make_lookup(pin_to_net, cc1_vals)
 
     def get_co(ref):
         net = lookup(ref)
         return co_vals[net] if (net and net in co_vals) else None
 
-    or_cps  = [r for r, t in cps if t == 'control_1']
-    and_cps = [r for r, t in cps if t == 'control_0']
+    def get_op_cc1(ref):
+        net = lookup(ref)
+        return cc1_vals[net] if (net and net in cc1_vals) else None
 
-    or_cc1s    = [v for r in or_cps  for v in [get_cc1(r)] if v is not None]
-    and_cc1s   = [v for r in and_cps for v in [get_cc1(r)] if v is not None]
-    op_co_list = [v for r in ops     for v in [get_co(r)]  if v is not None]
+    or_cps  = [(r, t) for r, t in cps if t == 'control_1']
+    and_cps = [(r, t) for r, t in cps if t == 'control_0']
 
-    avg_cc_or    = sum(or_cc1s)              / len(or_cc1s)   if or_cc1s    else 0.0
-    avg_1mcc_and = sum(1.0 - v for v in and_cc1s) / len(and_cc1s) if and_cc1s else 0.0
+    or_cc1s  = []
+    and_cc1s = []
+    for r, t in or_cps:
+        net, cc1 = resolve_cp_net(r, t, pin_to_net, cc1_vals, instances)
+        if cc1 is not None:
+            or_cc1s.append(cc1)
+    for r, t in and_cps:
+        net, cc1 = resolve_cp_net(r, t, pin_to_net, cc1_vals, instances)
+        if cc1 is not None:
+            and_cc1s.append(cc1)
+
+    op_co_list = [v for r in ops for v in [get_co(r)] if v is not None]
+
+    avg_cc_or    = sum(or_cc1s) / len(or_cc1s)                if or_cc1s    else 0.0
+    avg_1mcc_and = sum(1.0-v for v in and_cc1s) / len(and_cc1s) if and_cc1s else 0.0
     CC_Th = max(avg_cc_or, avg_1mcc_and)
     CO_Th = sum(op_co_list) / len(op_co_list) if op_co_list else 0.0
 
@@ -899,15 +985,18 @@ def identify_candidates(cps, ops, cc1_vals, co_vals, pin_to_net, verbose=True):
                   avg_cc_or, avg_1mcc_and, CC_Th))
         print('  COTh = avg CO of OPs = {:.4f}'.format(CO_Th))
 
+    # EO-CP: CO of the CP's controlled net must exceed COTh
     eo_cps = []
     for ref, tp_type in cps:
-        obs = get_co(ref)
+        net, _ = resolve_cp_net(ref, tp_type, pin_to_net, cc1_vals, instances)
+        obs = co_vals.get(net, None) if net else None
         if obs is not None and obs > CO_Th:
             eo_cps.append((ref, tp_type, obs))
 
+    # EC-OP: CC1 of OP net must be in (CCTh, 1-CCTh)
     ec_ops = []
     for ref in ops:
-        ctrl = get_cc1(ref)
+        ctrl = get_op_cc1(ref)
         if ctrl is not None and CC_Th < ctrl < (1.0 - CC_Th):
             ec_ops.append((ref, ctrl))
 

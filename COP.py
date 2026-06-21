@@ -45,11 +45,16 @@ CELL_OUTPUT_PORTS = {
     'NOR4':   (['A1','A2','A3','A4'],              ['Y']),
     'INV':    (['A'],                              ['Y']),
     'BUF':    (['A'],                              ['Y']),
+    'NBUFF':  (['A'],                              ['Y']),
+    'IBUFF':  (['A'],                              ['Y']),
     'AOI21':  (['A1','A2','A3'],                   ['Y']),
     'AOI22':  (['A1','A2','A3','A4'],              ['Y']),
     'OAI21':  (['A1','A2','A3'],                   ['Y']),
     'OAI22':  (['A1','A2','A3','A4'],              ['Y']),
     'OAI221': (['A1','A2','A3','A4','A5'],         ['Y']),
+    'OAI222': (['A1','A2','A3','A4','A5','A6'],    ['Y']),
+    'AOI221': (['A1','A2','A3','A4','A5'],         ['Y']),
+    'AOI222': (['A1','A2','A3','A4','A5','A6'],    ['Y']),
     'AO21':   (['A1','A2','A3'],                   ['Y']),
     'AO22':   (['A1','A2','A3','A4'],              ['Y']),
     'AO221':  (['A1','A2','A3','A4','A5'],         ['Y']),
@@ -62,7 +67,8 @@ CELL_OUTPUT_PORTS = {
     'MUX41':  (['A1','A2','A3','A4','S0','S1'],    ['Y']),
     'HADD':   (['A0','B0'],                        ['SO','CO']),
     'FADD':   (['A','B','CI'],                     ['S','CO']),
-    # Flip-flops - only D is the combinational input for COP purposes
+    # Flip-flops — only D is the combinational input for COP purposes
+    'SDFFX1': (['D'],                              ['Q','QN']),
     'SDFFX2': (['D'],                              ['Q','QN']),
     'DFFX1':  (['D'],                              ['Q','QN']),
 }
@@ -221,7 +227,7 @@ def make_lookup(pin_to_net, cc1_vals):
 
 
 # ---------------------------------------------------------------------------
-# COP FORWARD PASS - compute CC1 for every net
+# COP FORWARD PASS — compute CC1 for every net
 # ---------------------------------------------------------------------------
 
 def compute_cc1(base, input_cc1):
@@ -347,11 +353,35 @@ def compute_cc1(base, input_cc1):
                         c1('B') * c1('CI') -
                         2.0 * c1('A') * c1('B') * c1('CI'))
 
-    elif base in ('SDFFX2', 'DFFX1'):
+    elif base in ('SDFFX1', 'SDFFX2', 'DFFX1'):
         # Steady-state: Q tracks D
         q = c1('D')
         R['Q']  = clamp(q)
         R['QN'] = clamp(1.0 - q)
+
+    elif base in ('NBUFF', 'IBUFF'):
+        # Non-inverting buffer variants
+        R['Y'] = clamp(c1('A'))
+
+    elif base == 'AOI221':
+        # Y = ~((A1&A2)|(A3&A4)|A5)
+        and1 = c1('A1') * c1('A2')
+        and2 = c1('A3') * c1('A4')
+        R['Y'] = clamp((1.0 - and1) * (1.0 - and2) * c0('A5'))
+
+    elif base == 'AOI222':
+        # Y = ~((A1&A2)|(A3&A4)|(A5&A6))
+        and1 = c1('A1') * c1('A2')
+        and2 = c1('A3') * c1('A4')
+        and3 = c1('A5') * c1('A6')
+        R['Y'] = clamp((1.0 - and1) * (1.0 - and2) * (1.0 - and3))
+
+    elif base == 'OAI222':
+        # Y = ~((A1|A2)&(A3|A4)&(A5|A6))
+        or1 = 1.0 - c0('A1') * c0('A2')
+        or2 = 1.0 - c0('A3') * c0('A4')
+        or3 = 1.0 - c0('A5') * c0('A6')
+        R['Y'] = clamp(1.0 - or1 * or2 * or3)
 
     else:
         unknown_cells.add(base)
@@ -362,7 +392,7 @@ def compute_cc1(base, input_cc1):
 
 
 # ---------------------------------------------------------------------------
-# COP BACKWARD PASS - compute CO for each input given output CO values
+# COP BACKWARD PASS — compute CO for each input given output CO values
 # ---------------------------------------------------------------------------
 
 def compute_co_inputs(base, input_cc1, co_outputs):
@@ -561,8 +591,48 @@ def compute_co_inputs(base, input_cc1, co_outputs):
         R['B']  = clamp(co_s + co_co * (c1('A')  + c1('CI') - c1('A')  * c1('CI')))
         R['CI'] = clamp(co_s + co_co * (c1('A')  + c1('B')  - c1('A')  * c1('B')))
 
-    elif base in ('SDFFX2', 'DFFX1'):
+    elif base in ('SDFFX1', 'SDFFX2', 'DFFX1'):
         R['D'] = clamp(co('Q') + co('QN'))
+
+    elif base in ('NBUFF', 'IBUFF'):
+        R['A'] = clamp(co('Y'))
+
+    elif base == 'AOI221':
+        # Y = ~((A1&A2)|(A3&A4)|A5)
+        and1 = c1('A1') * c1('A2')
+        and2 = c1('A3') * c1('A4')
+        co_y = co('Y')
+        R['A1'] = clamp(co_y * c1('A2') * (1.0 - and2) * c0('A5'))
+        R['A2'] = clamp(co_y * c1('A1') * (1.0 - and2) * c0('A5'))
+        R['A3'] = clamp(co_y * c1('A4') * (1.0 - and1) * c0('A5'))
+        R['A4'] = clamp(co_y * c1('A3') * (1.0 - and1) * c0('A5'))
+        R['A5'] = clamp(co_y * (1.0 - (1.0 - and1) * (1.0 - and2)))
+
+    elif base == 'AOI222':
+        # Y = ~((A1&A2)|(A3&A4)|(A5&A6))
+        and1 = c1('A1') * c1('A2')
+        and2 = c1('A3') * c1('A4')
+        and3 = c1('A5') * c1('A6')
+        co_y = co('Y')
+        R['A1'] = clamp(co_y * c1('A2') * (1.0 - and2) * (1.0 - and3))
+        R['A2'] = clamp(co_y * c1('A1') * (1.0 - and2) * (1.0 - and3))
+        R['A3'] = clamp(co_y * c1('A4') * (1.0 - and1) * (1.0 - and3))
+        R['A4'] = clamp(co_y * c1('A3') * (1.0 - and1) * (1.0 - and3))
+        R['A5'] = clamp(co_y * c1('A6') * (1.0 - and1) * (1.0 - and2))
+        R['A6'] = clamp(co_y * c1('A5') * (1.0 - and1) * (1.0 - and2))
+
+    elif base == 'OAI222':
+        # Y = ~((A1|A2)&(A3|A4)&(A5|A6))
+        or1  = 1.0 - c0('A1') * c0('A2')
+        or2  = 1.0 - c0('A3') * c0('A4')
+        or3  = 1.0 - c0('A5') * c0('A6')
+        co_y = co('Y')
+        R['A1'] = clamp(co_y * c0('A2') * or2 * or3)
+        R['A2'] = clamp(co_y * c0('A1') * or2 * or3)
+        R['A3'] = clamp(co_y * c0('A4') * or1 * or3)
+        R['A4'] = clamp(co_y * c0('A3') * or1 * or3)
+        R['A5'] = clamp(co_y * c0('A6') * or1 * or2)
+        R['A6'] = clamp(co_y * c0('A5') * or1 * or2)
 
     return R
 
@@ -623,7 +693,7 @@ def build_and_sort(ports_in, instances, assigns):
     # dependencies would create false cycles through sequential feedback loops.
     ff_set = set()
     for idx, inst in enumerate(instances):
-        if get_cell_base(inst["cell"]) in ("SDFFX2", "DFFX1"):
+        if get_cell_base(inst["cell"]) in ("SDFFX1", "SDFFX2", "DFFX1"):
             ff_set.add(idx)
 
     for idx in range(n):
@@ -719,7 +789,7 @@ def run_cop(ports_in, ports_out, instances, assigns):
     # Flip-flop outputs are observable through the scan chain
     for inst in instances:
         base = get_cell_base(inst['cell'])
-        if base in ('SDFFX2', 'DFFX1'):
+        if base in ('SDFFX1', 'SDFFX2', 'DFFX1'):
             for op in ('Q', 'QN'):
                 net = inst['conn'].get(op)
                 if net:

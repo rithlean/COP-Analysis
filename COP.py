@@ -67,7 +67,7 @@ CELL_OUTPUT_PORTS = {
     'MUX41':  (['A1','A2','A3','A4','S0','S1'],    ['Y']),
     'HADD':   (['A0','B0'],                        ['SO','CO']),
     'FADD':   (['A','B','CI'],                     ['S','CO']),
-    # Flip-flops — only D is the combinational input for COP purposes
+    # Flip-flops  only D is the combinational input for COP purposes
     'SDFFX1': (['D'],                              ['Q','QN']),
     'SDFFX2': (['D'],                              ['Q','QN']),
     'DFFX1':  (['D'],                              ['Q','QN']),
@@ -227,7 +227,7 @@ def make_lookup(pin_to_net, cc1_vals):
 
 
 # ---------------------------------------------------------------------------
-# COP FORWARD PASS — compute CC1 for every net
+# COP FORWARD PASS  compute CC1 for every net
 # ---------------------------------------------------------------------------
 
 def compute_cc1(base, input_cc1):
@@ -392,7 +392,7 @@ def compute_cc1(base, input_cc1):
 
 
 # ---------------------------------------------------------------------------
-# COP BACKWARD PASS — compute CO for each input given output CO values
+# COP BACKWARD PASS  compute CO for each input given output CO values
 # ---------------------------------------------------------------------------
 
 def compute_co_inputs(base, input_cc1, co_outputs):

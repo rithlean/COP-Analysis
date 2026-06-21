@@ -1070,7 +1070,7 @@ def main():
 
     # ---- Candidate classification ----
     eo_cps, ec_ops, CC_Th, CO_Th = identify_candidates(
-        cps, ops, cc1_vals, co_vals, pin_to_net)
+        cps, ops, cc1_vals, co_vals, pin_to_net, instances)
 
     print('\n--- EO-CP candidates  (CO > {:.4f}) ---'.format(CO_Th))
     if eo_cps:

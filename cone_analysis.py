@@ -486,6 +486,21 @@ def check_rule2(eo_cp_net, ec_op_net, eo_cp_required_value, graph,
         nonzero for the pairing to be considered safe (the EO-CP's
         original blocked cone output, e.g. ConeG6's output net).
 
+    IMPORTANT: this check only has teeth when the EC-OP's forward
+    propagation actually RECONVERGES with the blocked cone (matching
+    Fig. 8's setup). For the common case where an EC-OP/EO-CP pair
+    shares no local structure at all, the forward injection never
+    reaches a gate that also touches blocked_cone_nets, so there is
+    nothing to block -- this correctly reports SAFE, not because the
+    check is vacuous, but because there is genuinely no interaction
+    to flag. This is distinct from "reached the blocked cone and found
+    its observability driven to zero", which correctly reports BLOCKED.
+    The two cases must not be conflated: falling back to the
+    pre-existing global co_vals for "never reached" would always
+    report SAFE regardless of the pairing (co_vals[eo_cp_net] is
+    already > COTh by definition of being an EO-CP), making the check
+    unable to ever fail. So no such fallback is used here.
+
     Returns:
         dict with keys 'direct' and 'inverted', each True (safe to use
         that control scheme) or False (blocked).
@@ -503,8 +518,12 @@ def check_rule2(eo_cp_net, ec_op_net, eo_cp_required_value, graph,
             last_gates, forced_cc, graph, instances,
             cc1_vals, co_vals, stop_nets)
 
-        blocked = any(local_co.get(n, co_vals.get(n, 0.0)) <= 1e-9
-                    for n in blocked_cone_nets)
+        # Only nets actually reached by the bounded local backward pass
+        # count. A net absent from local_co means the propagation never
+        # reconverged with the blocked cone for this scheme -- no
+        # interaction, hence no risk of blocking, hence safe.
+        blocked = any(local_co[n] <= 1e-9
+                    for n in blocked_cone_nets if n in local_co)
         results[scheme] = not blocked
 
     return results

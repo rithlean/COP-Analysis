@@ -1,6 +1,12 @@
 """
 cone_analysis.py
 
+# VERSION: 2026-06-22 rev3 -- fixed check_rule2's co_vals fallback bug
+# (rev1: initial Rule1/Rule2 impl; rev2: added compound-gate dominance
+# for AOI21/OAI21/AO21/OA21 + explicit no-dominance gate list; rev3:
+# removed the co_vals fallback in check_rule2 that made it vacuously
+# always pass -- see chat history for the s38417 100%-pass investigation)
+
 SPAR Section V: Cone Analysis.
 Implements Rule 1 (combinational loop generation) and Rule 2
 (fault-propagation block) checks for candidate EO-CP / EC-OP pairs,

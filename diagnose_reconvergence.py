@@ -1,6 +1,10 @@
 """
 diagnose_reconvergence.py
 
+# VERSION: 2026-06-22 rev2 -- combinational-only vs through-FFs split
+# (rev1 had no FF boundary at all in count_forward_reachable; this rev
+# adds stop_at_scan to match cone_analysis.is_reachable's real behavior)
+
 Sanity check for the 288/288 pass rate from run_cone_analysis.py.
 Distinguishes two possibilities:
   (a) Genuine: these EO-CP/EC-OP pairs really don't share any forward

@@ -11,14 +11,19 @@ Run on synopsys01, in the same directory as COP.py and cone_analysis.py:
 
 KNOWN SIMPLIFICATION (flagged, not hidden): Rule 2's blocked_cone_nets
 argument is approximated here as {eo_cp_net} itself -- i.e. we check
-whether pairing with a given EC-OP would block the EO-CP line's OWN
-observability. The paper's Fig. 9 example traces a SPECIFIC upstream
-fanin cone (ConeG6) feeding INTO the gate where the EO-CP and EC-OP
-paths reconverge, which is a more precise (and more permissive) check
-than just watching the EO-CP net itself. This approximation is
-reasonable for a first real-data smoke test but should be revisited
-before trusting Rule 2's pass/fail verdicts for production pairing
-decisions.
+whether pairing with a given EC-OP would drive the EO-CP line's own
+observability to zero THROUGH THIS SPECIFIC PAIRING'S new local
+wiring. This only has teeth when the EC-OP's forward propagation
+actually reconverges with the EO-CP net (matching Fig. 8's setup) --
+for the common case of two structurally unrelated nets in a large
+netlist, there is no reconvergence, so Rule 2 correctly reports safe
+(not because the check is vacuous, but because there is genuinely no
+interaction to flag). The paper's Fig. 9 example traces a SPECIFIC
+upstream fanin cone (ConeG6) feeding INTO the gate where the EO-CP and
+EC-OP paths reconverge; using {eo_cp_net} as a stand-in for that cone's
+output is a reasonable approximation for a first real-data test, but
+the fully faithful version would identify the EO-CP's actual fanin
+cone gates specifically rather than just the EO-CP net.
 """
 
 from __future__ import print_function
@@ -71,7 +76,7 @@ def main():
     lookup = COP.make_lookup(pin_to_net, cc1_vals)
 
     print('\n--- Cone analysis: checking EO-CP x EC-OP pairs ---')
-    print('(blocked_cone_nets approximated as {eo_cp_net} -- see module docstring)\n')
+    print('(blocked_cone_nets = {eo_cp_net}; Rule 2 only triggers on real reconvergence -- see module docstring)\n')
 
     n_checked = 0
     n_rule1_pass = 0

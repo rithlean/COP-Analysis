@@ -1,6 +1,11 @@
 """
 run_cone_analysis.py
 
+# VERSION: 2026-06-22 rev2 -- updated docstring/print to match
+# cone_analysis.py rev3's fixed check_rule2 semantics (no co_vals
+# fallback; "never reached" now correctly means "safe, no interaction"
+# rather than relying on the removed vacuous-pass fallback)
+
 Driver script: wires COP.py's EO-CP/EC-OP candidate identification
 into cone_analysis.py's Rule 1 / Rule 2 checks, on a real netlist.
 

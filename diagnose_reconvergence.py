@@ -24,13 +24,22 @@ import COP
 import cone_analysis as CA
 
 
-def count_forward_reachable(start_net, graph, instances, max_visit=None):
+def count_forward_reachable(start_net, graph, instances, max_visit=None,
+                            stop_at_scan=True):
     """BFS forward from start_net, return the set of all reachable nets
     (no target, just full reachability size) -- a sanity check on
     whether the graph is connected the way a 5133-instance netlist
-    should be."""
+    should be.
+
+    stop_at_scan mirrors cone_analysis.is_reachable's actual behavior:
+    Rule 1 only cares about COMBINATIONAL loops, so a path that only
+    exists by crossing through a flip-flop's D->Q is not a loop risk
+    and must NOT count as reachable here, or this diagnostic measures
+    a different (larger) graph than what check_rule1 actually checks.
+    """
     visited = set([start_net])
     queue = deque([start_net])
+    ff_bases = ('SDFFX1', 'SDFFX2', 'DFFX1')
     while queue:
         net = queue.popleft()
         if max_visit and len(visited) >= max_visit:
@@ -38,6 +47,8 @@ def count_forward_reachable(start_net, graph, instances, max_visit=None):
         for (inst_idx, _ip) in graph.net_to_sinks.get(net, []):
             inst = instances[inst_idx]
             base = COP.get_cell_base(inst['cell'])
+            if stop_at_scan and base in ff_bases:
+                continue
             info = COP.CELL_OUTPUT_PORTS.get(base)
             if info is None:
                 continue
@@ -86,9 +97,12 @@ def main():
             print('  {:30s} -> COULD NOT RESOLVE NET'.format(eo_ref))
             continue
         eo_nets.append((eo_ref, eo_net))
-        reachable = count_forward_reachable(eo_net, sp_graph, instances, max_visit=2000)
-        print('  {:30s} net={:15s} forward-reachable nets (capped at 2000): {}'.format(
-            eo_ref, eo_net, len(reachable)))
+        reachable_comb = count_forward_reachable(
+            eo_net, sp_graph, instances, max_visit=2000, stop_at_scan=True)
+        reachable_all = count_forward_reachable(
+            eo_net, sp_graph, instances, max_visit=2000, stop_at_scan=False)
+        print('  {:30s} net={:15s} combinational-only={:5d}  through-FFs={:5d}'.format(
+            eo_ref, eo_net, len(reachable_comb), len(reachable_all)))
 
     # --- Check 2: are EC-OP nets actually IN any EO-CP's reachable set? ---
     print('\n--- Check 2: do EC-OP nets fall inside ANY EO-CP forward cone? ---\n')
@@ -101,12 +115,22 @@ def main():
 
     if eo_nets:
         first_eo_ref, first_eo_net = eo_nets[0]
-        full_reachable = count_forward_reachable(first_eo_net, sp_graph, instances)
-        print('  Full (uncapped) forward reachability from {} ({}): {} nets'.format(
-            first_eo_ref, first_eo_net, len(full_reachable)))
-        hits = [ec_ref for ec_ref, ec_net in ec_nets if ec_net in full_reachable]
-        print('  Of {} sampled EC-OP nets, {} fall inside this cone: {}'.format(
-            len(ec_nets), len(hits), hits[:10]))
+        full_reachable_comb = count_forward_reachable(
+            first_eo_net, sp_graph, instances, stop_at_scan=True)
+        full_reachable_all = count_forward_reachable(
+            first_eo_net, sp_graph, instances, stop_at_scan=False)
+        print('  Combinational-only reachability from {} ({}): {} nets'.format(
+            first_eo_ref, first_eo_net, len(full_reachable_comb)))
+        print('  Through-FFs reachability from {} ({}): {} nets'.format(
+            first_eo_ref, first_eo_net, len(full_reachable_all)))
+        hits_comb = [ec_ref for ec_ref, ec_net in ec_nets if ec_net in full_reachable_comb]
+        hits_all = [ec_ref for ec_ref, ec_net in ec_nets if ec_net in full_reachable_all]
+        print('  Of {} sampled EC-OP nets: {} fall inside COMBINATIONAL-ONLY cone, '
+            '{} fall inside THROUGH-FFS cone'.format(
+                len(ec_nets), len(hits_comb), len(hits_all)))
+        print('  Combinational-only hits (these are the ones Rule1 should reject):', hits_comb[:10])
+        print('  (the difference between these two counts is reconvergence that ONLY')
+        print('   exists by crossing a scan flip-flop, which Rule 1 correctly ignores)')
 
     # --- Check 3: do the resolved nets actually appear as keys in
     # net_to_sinks or net_to_driver_port at all? (sanity check that
